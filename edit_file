@@ -1,47 +1,38 @@
-/* Status indicator - Left aligned */
+/* Status Indicator - Left Aligned */
 .status-indicator {
-  background: white;
-  border: 1px solid #e0e0e0;
-  border-radius: 8px;
-  padding: 12px;
-  margin: 8px 0;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
   align-self: flex-start; /* This makes it left-aligned */
-  max-width: 80%; /* Match message width */
+  margin-left: 0;
 }
 
-.status-content {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+/* System Messages - Left Aligned */
+.system-message {
+  text-align: left;
+  justify-content: flex-start;
 }
 
-.status-icon {
-  font-size: 1.2em;
+.system-content {
+  margin-left: 0;
+  text-align: left;
 }
 
-.status-message {
-  flex: 1;
-  font-weight: 500;
-  color: #333;
+/* Make Input Boxes Smaller */
+.input-container {
+  padding: 10px 16px; /* Reduced padding */
 }
 
-.progress-bar {
-  width: 100px;
-  height: 6px;
-  background: #f0f0f0;
-  border-radius: 3px;
-  overflow: hidden;
+.message-input {
+  padding: 6px 12px; /* Smaller padding */
+  font-size: 14px; /* Slightly smaller font */
+  height: 34px; /* Fixed height */
 }
 
-.progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #4CAF50, #8BC34A);
-  transition: width 0.3s ease;
+.send-button {
+  padding: 6px 14px; /* Smaller padding */
+  font-size: 14px; /* Slightly smaller font */
+  height: 34px; /* Fixed height */
+  min-width: 55px; /* Minimum width */
 }
-########################
-# In the event_stream function, replace the token usage section:
-
+#########################################
 # --- TYPING: Result generation
 yield sse_event({
     "type": "STATE_UPDATE", 
@@ -68,53 +59,6 @@ if total_tokens > 0:
 
 # Stream summary as chunks (typing effect)
 msg_id = f"msg-{uuid.uuid4().hex[:8]}"
-
-########################################
-/* Input Container - Smaller */
-.input-container {
-  display: flex;
-  gap: 8px; /* Reduced from 12px */
-  padding: 12px 16px; /* Reduced padding */
-  background: white;
-  border-top: 1px solid #e0e0e0;
-}
-
-.message-input {
-  flex: 1;
-  padding: 8px 12px; /* Smaller padding */
-  border: 1px solid #ddd;
-  border-radius: 20px; /* Slightly smaller radius */
-  font-size: 13px; /* Smaller font */
-  outline: none;
-  transition: border-color 0.2s;
-  height: 36px; /* Fixed height */
-}
-
-.message-input:focus {
-  border-color: #007bff;
-}
-
-.send-button {
-  padding: 8px 16px; /* Smaller padding */
-  background: #007bff;
-  color: white;
-  border: none;
-  border-radius: 20px; /* Slightly smaller radius */
-  cursor: pointer;
-  font-size: 13px; /* Smaller font */
-  transition: background-color 0.2s;
-  height: 36px; /* Fixed height */
-  min-width: 60px; /* Minimum width */
-}
-
-.send-button:hover:not(:disabled) {
-  background: #0056b3;
-}
-
-.send-button:disabled {
-  background: #ccc;
-  cursor: not-allowed;
-}
 ##################################
 import React from "react";
 
