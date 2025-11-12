@@ -14,7 +14,7 @@ app = FastAPI(title="FlightOps — AG-UI Adapter")
 # CORS (adjust origins for your Vite origin)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],           # lock down in prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +35,6 @@ async def startup_event():
     try:
         await ensure_mcp_connected()
     except Exception:
-        # don't crash; /health will reflect status
         pass
 
 @app.get("/")
@@ -51,10 +50,6 @@ async def health():
         return {"status": "unhealthy", "mcp_connected": False, "error": str(e)}
 
 def chunk_text(txt: str, max_len: int = 200) -> List[str]:
-    """
-    Split text into small chunks for streaming as typing.
-    Prefer sentence boundaries; fallback by length.
-    """
     txt = txt or ""
     parts: List[str] = []
     buf = ""
@@ -67,7 +62,6 @@ def chunk_text(txt: str, max_len: int = 200) -> List[str]:
 
     for ch in txt:
         buf += ch
-        # flush at sentence end or when too long
         if ch in ".!?\n" and len(buf) >= max_len // 2:
             flush()
         elif len(buf) >= max_len:
@@ -77,15 +71,6 @@ def chunk_text(txt: str, max_len: int = 200) -> List[str]:
 
 @app.post("/agent", response_class=StreamingResponse)
 async def run_agent(request: Request):
-    """
-    AG-UI compatible streaming endpoint (SSE).
-    Expected body:
-      {
-        thread_id?, run_id?,
-        messages: [{role, content}, ...],
-        tools?: []
-      }
-    """
     try:
         body = await request.json()
     except Exception:
@@ -151,7 +136,8 @@ async def run_agent(request: Request):
         plan = plan_data.get("plan", []) if isinstance(plan_data, dict) else []
         planning_usage = plan_data.get("llm_usage", {})
         
-        # Send token usage for planning
+        # DEBUG: Send token usage for planning
+        print(f"DEBUG: Planning token usage: {planning_usage}")
         if planning_usage:
             yield sse_event({
                 "type": "TOKEN_USAGE",
@@ -186,7 +172,7 @@ async def run_agent(request: Request):
 
         results = []
         num_steps = max(1, len(plan))
-        per_step = 60.0 / num_steps  # 20% to 80%
+        per_step = 60.0 / num_steps
         current_progress = 20.0
 
         for step_index, step in enumerate(plan):
@@ -196,7 +182,6 @@ async def run_agent(request: Request):
             tool_name = step.get("tool")
             args = step.get("arguments", {}) or {}
 
-            # Update processing status for current tool
             yield sse_event({
                 "type": "STATE_UPDATE", 
                 "state": {
@@ -208,7 +193,6 @@ async def run_agent(request: Request):
 
             tool_call_id = f"toolcall-{uuid.uuid4().hex[:8]}"
             
-            # Tool call events
             yield sse_event({
                 "type": "TOOL_CALL_START",
                 "toolCallId": tool_call_id,
@@ -223,13 +207,11 @@ async def run_agent(request: Request):
             })
             yield sse_event({"type": "TOOL_CALL_END", "toolCallId": tool_call_id})
 
-            # call tool
             try:
                 tool_result = await mcp_client.invoke_tool(tool_name, args)
             except Exception as exc:
                 tool_result = {"error": str(exc)}
 
-            # result
             yield sse_event({
                 "type": "TOOL_CALL_RESULT",
                 "message": {
@@ -247,10 +229,8 @@ async def run_agent(request: Request):
                 "tool": tool_name
             })
 
-            # update progress
             current_progress = min(80.0, 20.0 + per_step * (step_index + 1))
             
-            # heartbeat every ~15s while long tools run
             if time.time() - last_heartbeat > 15:
                 yield sse_event({"type": "HEARTBEAT", "ts": time.time()})
                 last_heartbeat = time.time()
@@ -270,7 +250,8 @@ async def run_agent(request: Request):
             assistant_text = summary_data.get("summary", "") if isinstance(summary_data, dict) else str(summary_data)
             summarization_usage = summary_data.get("llm_usage", {})
             
-            # Send token usage for summarization
+            # DEBUG: Send token usage for summarization
+            print(f"DEBUG: Summarization token usage: {summarization_usage}")
             if summarization_usage:
                 yield sse_event({
                     "type": "TOKEN_USAGE",
@@ -288,6 +269,7 @@ async def run_agent(request: Request):
                     "total_tokens": safe_int(planning_usage.get('total_tokens', 0)) + safe_int(summarization_usage.get('total_tokens', 0))
                 }
                 
+                print(f"DEBUG: Total token usage: {total_usage}")
                 yield sse_event({
                     "type": "TOKEN_USAGE",
                     "phase": "total",
@@ -297,20 +279,18 @@ async def run_agent(request: Request):
         except Exception as e:
             assistant_text = f"❌ Failed to summarize results: {e}"
 
-        # Stream summary as chunks (typing effect)
+        # Stream summary as chunks
         msg_id = f"msg-{uuid.uuid4().hex[:8]}"
         
-        # Start the message
         yield sse_event({
             "type": "TEXT_MESSAGE_CONTENT",
             "message": {
                 "id": msg_id,
                 "role": "assistant",
-                "content": ""  # Start with empty content
+                "content": ""
             }
         })
 
-        # Stream chunks with typing effect
         chunks = chunk_text(assistant_text, max_len=150)
         for i, chunk in enumerate(chunks):
             yield sse_event({
@@ -318,11 +298,10 @@ async def run_agent(request: Request):
                 "message": {
                     "id": msg_id,
                     "role": "assistant", 
-                    "delta": chunk  # AG-UI delta for streaming
+                    "delta": chunk
                 }
             })
             
-            # Update typing progress
             typing_progress = 85 + (i / len(chunks)) * 15
             yield sse_event({
                 "type": "STATE_UPDATE",
@@ -333,7 +312,7 @@ async def run_agent(request: Request):
                 }
             })
             
-            await asyncio.sleep(0.03)  # Typing speed
+            await asyncio.sleep(0.03)
 
         # Final state
         yield sse_event({"type": "STATE_SNAPSHOT", "snapshot": {"plan": plan, "results": results}})
