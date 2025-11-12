@@ -218,7 +218,7 @@ class FlightOpsMCPClient:
             logger.error(f"Error during disconnect: {e}")
 
     # -------------------- AZURE OPENAI WRAPPER -------------------------
-    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> dict:
         try:
             completion = client_azure.chat.completions.create(
                 model=AZURE_OPENAI_DEPLOYMENT,
@@ -226,17 +226,17 @@ class FlightOpsMCPClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            usage_obj=getattr(completion,"usage",None)
-            usage=None
+            usage_obj = getattr(completion, "usage", None)
+            usage = None
             if usage_obj is not None:
-                usage={
-                    "prompt_tokens":getattr(usage_obj,"prompt_tokens",0) or 0,
-                    "completion_tokens":getattr(usage_obj,"completion_tokens",0) or 0,
-                    "total_tokens":getattr(usage_obj,"total_tokens",0) or 0,
+                usage = {
+                    "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
                 }
-            return{
-                "content":completion.choices[0].message.content,
-                "usage":usage
+            return {
+                "content": completion.choices[0].message.content,
+                "usage": usage
             }
         except Exception as e:
             logger.error(f"Azure OpenAI API error: {e}")
@@ -280,48 +280,39 @@ class FlightOpsMCPClient:
 
     # -------------------- LLM PLANNING & SUMMARIZATION -------------------------
     def plan_tools(self, user_query: str) -> dict:
-        """
-        Ask the LLM to produce a valid JSON plan for which MCP tools to call.
-        Cleans out Markdown-style fences (```json ... ```), which some models add.
-        """
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_PLAN},
             {"role": "user", "content": user_query},
         ]
 
         res = self._call_azure_openai(messages, temperature=0.1)
-        content=res.get("content")
-        plan_usage=res.get("usage")
+        content = res.get("content")
+        plan_usage = res.get("usage")
+        
         if not content:
             logger.warning("⚠️ LLM returned empty response during plan generation.")
-            return {"plan": [],"llm_usage":plan_usage}
+            return {"plan": [], "llm_usage": plan_usage}
 
-        
         cleaned = content.strip()
         if cleaned.startswith("```"):
-            
             cleaned = cleaned.strip("`")
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].strip()
-            
             cleaned = cleaned.replace("```", "").strip()
 
-        
         if cleaned != content:
             logger.debug(f"🔍 Cleaned LLM plan output:\n{cleaned}")
 
-       
         try:
             plan = json.loads(cleaned)
             if isinstance(plan, dict) and "plan" in plan:
-                return {"plan":plan["plan"],"llm_usage":plan_usage}
+                return {"plan": plan["plan"], "llm_usage": plan_usage}
             else:
                 logger.warning("⚠️ LLM output did not contain 'plan' key.")
-                return {"plan": [],"llm_usage":plan_usage}
+                return {"plan": [], "llm_usage": plan_usage}
         except json.JSONDecodeError:
             logger.warning(f"❌ Could not parse LLM plan output after cleaning:\n{cleaned}")
-            return {"plan": [],"llm_usage":plan_usage}
-
+            return {"plan": [], "llm_usage": plan_usage}
 
     def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
         messages = [
@@ -331,9 +322,8 @@ class FlightOpsMCPClient:
             {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
         ]
         res = self._call_azure_openai(messages, temperature=0.3)
-        return {"summary":res.get("content"),"llm_usage":res.get("usage")}
+        return {"summary": res.get("content"), "llm_usage": res.get("usage")}
 
-   
     async def run_query(self, user_query: str) -> dict:
         """
         Full flow with proper token tracking for cost monitoring
@@ -350,7 +340,7 @@ class FlightOpsMCPClient:
                     "token_usage": {
                         "planning": planning_usage,
                         "summarization": None,
-                        "total": planning_usage  # Only planning tokens used
+                        "total": planning_usage
                     }
                 }
 
@@ -363,13 +353,11 @@ class FlightOpsMCPClient:
                 # Clean up bad args
                 args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
 
-                # Safety for MongoDB query
                 if tool == "raw_mongodb_query":
                     query_json = args.get("query_json", "")
                     if not query_json:
                         results.append({"raw_mongodb_query": {"error": "Empty query_json"}})
                         continue
-                    # Enforce safe default limit
                     args["limit"] = int(args.get("limit", 50))
                     logger.info(f"Executing raw MongoDB query: {query_json}")
 
@@ -382,7 +370,6 @@ class FlightOpsMCPClient:
 
             # Calculate total tokens for cost tracking
             def safe_int(value):
-                """Safely convert to int, return 0 if None or invalid"""
                 try:
                     return int(value) if value is not None else 0
                 except (ValueError, TypeError):
