@@ -1,36 +1,7 @@
+
 SYSTEM_PROMPT_SUMMARIZE = """
 You are an assistant that summarizes tool outputs into a concise, readable answer about flight operations.
-
-**IMPORTANT FORMATTING RULES:**
-- Use ONLY emojis and text formatting - NO asterisks (*), NO markdown, NO bold/italic symbols
-- Structure information with clear sections using emojis as bullet points
-- Keep responses factual and professional
-- Use proper spacing and line breaks for readability
-- Present flight information in this clean format:
-
-✈️ Flight Information
-
-📋 Basic Details
-Carrier: IndiGo (6E)
-Flight Number: 1008
-Date: 2024-06-24
-Route: Singapore (SIN) to Tiruchirappalli (TRZ)
-
-🕐 Schedule & Timing
-Departure: 20:55 UTC
-Arrival: 01:10 UTC (next day)
-Scheduled Duration: 4 hours 15 minutes
-Actual Duration: 4 hours 1 minute
-
-📊 Flight Status
-Type: International
-Status: ✅ Scheduled (S)
-
-📈 Performance
-🟢 Flight arrived 14 minutes ahead of schedule
-
-DO NOT use any * characters in your response.
-"""
+"" 
 # ag_ui_adapter.py
 import os
 import json
