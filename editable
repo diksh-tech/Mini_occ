@@ -1,123 +1,472 @@
-from bson import ObjectId  # add at top of file if not already present
-
 @mcp.tool()
-async def get_delay_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "", option_id: str = "") -> str:
+async def get_delay_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "", selected_route: str = "") -> str:
     """
-    Enhanced get_delay_summary with counting + options behavior.
-
-    - If option_id is provided, try to fetch that specific document and return its full delay info.
-    - Otherwise, count matching docs:
-        * 0 -> return 404
-        * 1 -> return full document (legacy behavior)
-        * >1 -> return compact list of options for the UI to present
+    Summarize delay reasons, durations, and total delay time for a specific flight.
+    If multiple routes exist, returns route options for user selection.
+    
+    Args:
+        carrier: Airline carrier code (e.g., "6E", "AI")
+        flight_number: Flight number as string (e.g., "215")
+        date_of_origin: Date in YYYY-MM-DD format (e.g., "2024-06-23")
+        selected_route: Route in format "START_STATION-END_STATION" (optional, for when user selects from multiple options)
     """
-    logger.info(f"get_delay_summary: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}, option_id={option_id}")
+    logger.info(f"get_delay_summary: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}, selected_route={selected_route}")
+    
+    # Normalize inputs
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    if date_of_origin and not dob:
+        return response_error("Invalid date_of_origin format. Expected YYYY-MM-DD or common date formats", 400)
+    
+    # Step 1: Build base query
+    base_query = make_query(carrier, fn, dob)
+    
     try:
-        fn = normalize_flight_number(flight_number) if flight_number else None
-        dob = validate_date(date_of_origin) if date_of_origin else None
-
-        if date_of_origin and not dob:
-            return response_error("Invalid date_of_origin format.", 400)
-
-        query = make_query(carrier, fn, dob)
         _, _, col = await get_mongodb_client()
-
-        # If option_id provided -> try direct fetch (prefer _id if valid)
-        if option_id:
-            # try treat as ObjectId
-            doc = None
+        
+        # Step 2: Count documents for this flight
+        count = await col.count_documents(base_query)
+        logger.info(f"Found {count} documents for query: {json.dumps(base_query)}")
+        
+        # Step 3: If multiple documents and no route selected, return route options ONLY
+        if count > 1 and not selected_route:
+            # Get minimal route information for selection
+            cursor = col.find(base_query, {
+                "flightLegState.startStation": 1,
+                "flightLegState.endStation": 1,
+                "flightLegState.scheduledStartTime": 1,
+                "flightLegState.flightStatus": 1,
+                "_id": 0  # We don't need _id for selection
+            })
+            
+            routes = []
+            async for doc in cursor:
+                route_info = {
+                    "route_id": f"{doc.get('flightLegState', {}).get('startStation', '')}-{doc.get('flightLegState', {}).get('endStation', '')}",
+                    "startStation": doc.get("flightLegState", {}).get("startStation", "Unknown"),
+                    "endStation": doc.get("flightLegState", {}).get("endStation", "Unknown"),
+                    "scheduledStartTime": doc.get("flightLegState", {}).get("scheduledStartTime", "Unknown"),
+                    "flightStatus": doc.get("flightLegState", {}).get("flightStatus", "Unknown")
+                }
+                # Only add unique routes
+                if not any(r["route_id"] == route_info["route_id"] for r in routes):
+                    routes.append(route_info)
+            
+            return response_ok({
+                "status": "route_selection_required",
+                "multiple_routes": True,
+                "message": f"Found {len(routes)} different routes for flight {carrier}{flight_number} on {date_of_origin}.",
+                "available_routes": routes,
+                "instruction": "Please select a route by providing the route number (1, 2, 3, etc.)",
+                "next_step": "Call this tool again with the selected_route parameter"
+            })
+        
+        # Step 4: If single document or route selected, proceed with actual delay summary
+        final_query = base_query.copy()
+        if selected_route:
             try:
-                if ObjectId.is_valid(option_id):
-                    doc = await col.find_one({"_id": ObjectId(option_id)})
-            except Exception:
-                doc = None
-
-            # fallback to seq-based option_id like "CARRIER#FLIGHT#YYYY-MM-DD#SEQ"
-            if not doc:
-                parts = option_id.split("#")
-                if len(parts) >= 4:
-                    opt_carrier, opt_flight, opt_date, opt_seq = parts[0], parts[1], parts[2], parts[3]
-                    q2 = {
-                        "flightLegState.carrier": opt_carrier,
-                        "flightLegState.flightNumber": int(opt_flight) if str(opt_flight).isdigit() else opt_flight,
-                        "flightLegState.dateOfOrigin": opt_date,
-                        "flightLegState.seqNumber": int(opt_seq) if str(opt_seq).isdigit() else opt_seq
-                    }
-                    doc = await col.find_one(q2)
-
-            if not doc:
-                return response_error("No document found for provided option_id.", 404)
-
-            # clean and return full doc
-            doc.pop("_id", None)
-            doc.pop("_class", None)
-            return response_ok(doc)
-
-        # No option_id: count matching documents
-        # Use count_documents — ensure you have appropriate indexes for performance
-        try:
-            count = await col.count_documents(query)
-        except Exception:
-            # fallback: fast existence check + small scan
-            cursor = col.find(query).limit(2)
-            docs_tmp = []
-            async for d in cursor:
-                docs_tmp.append(d)
-            count = len(docs_tmp)
-
-        if count == 0:
-            return response_error("No matching document found for given query.", 404)
-
-        # If only one document -> fetch full doc and return (legacy behavior)
-        if count == 1:
-            # fetch full doc
-            full_doc = await col.find_one(query)
-            if not full_doc:
-                return response_error("Could not fetch document.", 500)
-            full_doc.pop("_id", None)
-            full_doc.pop("_class", None)
-            return response_ok(full_doc)
-
-        # If multiple documents -> return compact options for UI
+                start_station, end_station = selected_route.split('-')
+                final_query["flightLegState.startStation"] = start_station
+                final_query["flightLegState.endStation"] = end_station
+                logger.info(f"Query modified with selected route: {start_station} -> {end_station}")
+            except ValueError:
+                return response_error("Invalid selected_route format. Expected 'START_STATION-END_STATION'", 400)
+        
+        # Step 5: Fetch the actual delay summary
         projection = {
-            "_id": 1,
             "flightLegState.carrier": 1,
             "flightLegState.flightNumber": 1,
             "flightLegState.dateOfOrigin": 1,
-            "flightLegState.seqNumber": 1,
             "flightLegState.startStation": 1,
             "flightLegState.endStation": 1,
-            "flightLegState.startStationICAO": 1,
-            "flightLegState.endStationICAO": 1,
             "flightLegState.scheduledStartTime": 1,
-            "flightLegState.scheduledEndTime": 1,
-            "flightLegState.delays": 1
+            "flightLegState.operation.actualTimes.offBlock": 1,
+            "flightLegState.delays": 1,
+            "flightLegState.flightStatus": 1,
+            "flightLegState.operationalStatus": 1,
+            "flightLegState.startTimeOffset": 1,
+            "flightLegState.endTimeOffset": 1
         }
+        
+        result = await _fetch_one_async(final_query, projection)
+        
+        # Add route information to the final result
+        if isinstance(result, str):
+            try:
+                result_dict = json.loads(result)
+                if result_dict.get("ok") and result_dict.get("data"):
+                    result_dict["data"]["selected_route"] = selected_route if selected_route else "auto_selected"
+                    return json.dumps(result_dict, indent=2, default=str)
+            except:
+                pass
+        
+        return result
+        
+    except Exception as e:
+        logger.exception("Error in get_delay_summary")
+################################################################
+# Global context storage for route selection
+route_selection_context = {}
 
-        cursor = col.find(query, projection).sort("flightLegState.seqNumber", 1).limit(50)
-        options = []
-        async for d in cursor:
-            fl = d.get("flightLegState", {}) or {}
-            _id_str = str(d.get("_id")) if d.get("_id") else None
-            option_id_det = f"{fl.get('carrier') or ''}#{fl.get('flightNumber') or ''}#{fl.get('dateOfOrigin') or ''}#{fl.get('seqNumber') or ''}"
-            options.append({
-                "_id": _id_str,                      # stringified Mongo id (server can accept later)
-                "option_id": option_id_det,          # deterministic id for UI
-                "carrier": fl.get("carrier"),
-                "flightNumber": fl.get("flightNumber"),
-                "dateOfOrigin": fl.get("dateOfOrigin"),
-                "seqNumber": fl.get("seqNumber"),
-                "startStation": fl.get("startStation"),
-                "endStation": fl.get("endStation"),
-                "startStationICAO": fl.get("startStationICAO"),
-                "endStationICAO": fl.get("endStationICAO"),
-                "scheduledStartTime": fl.get("scheduledStartTime"),
-                "scheduledEndTime": fl.get("scheduledEndTime"),
-                "delay_summary": (fl.get("delays") or {}).get("total") if isinstance(fl.get("delays", {}), dict) else None
+@app.post("/agent", response_class=StreamingResponse)
+async def run_agent(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    thread_id = body.get("thread_id") or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
+    messages = body.get("messages", [])
+    
+    # Check if this is a route selection response
+    is_route_selection = False
+    user_selected_route = None
+    original_tool_args = None
+    
+    if thread_id in route_selection_context:
+        # This is a follow-up message for route selection
+        last_message = messages[-1] if messages else {}
+        if isinstance(last_message, dict) and last_message.get("role") == "user":
+            user_input = last_message.get("content", "").strip()
+            is_route_selection = True
+            context = route_selection_context[thread_id]
+            available_routes = context.get("available_routes", [])
+            original_tool_args = context.get("original_args", {})
+            
+            # Parse user's route selection
+            try:
+                # Extract number from input (handle "1", "option 1", "route 1", etc.)
+                import re
+                numbers = re.findall(r'\d+', user_input)
+                if numbers:
+                    route_number = int(numbers[0])
+                    if 1 <= route_number <= len(available_routes):
+                        selected_route = available_routes[route_number - 1]["route_id"]
+                        user_selected_route = selected_route
+                    else:
+                        # Invalid route number
+                        user_selected_route = "invalid"
+                else:
+                    # No number found
+                    user_selected_route = "invalid"
+            except:
+                user_selected_route = "invalid"
+
+    # Get user query
+    user_query = ""
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            user_query = last.get("content", "") or ""
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        last_heartbeat = time.time()
+
+        # --- RUN STARTED
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+        
+        # --- CASE 1: Route Selection Response
+        if is_route_selection:
+            if user_selected_route == "invalid":
+                # Invalid selection - show error and ask again
+                yield sse_event({
+                    "type": "TEXT_MESSAGE_CONTENT",
+                    "message": {
+                        "id": f"msg-{uuid.uuid4().hex[:8]}",
+                        "role": "assistant",
+                        "content": "❌ Invalid selection. Please enter only the route number (1, 2, 3, etc.)."
+                    }
+                })
+                yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+                yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+                return
+            
+            # Valid route selected - process the actual query
+            yield sse_event({
+                "type": "STATE_UPDATE", 
+                "state": {
+                    "phase": "processing", 
+                    "progress_pct": 50,
+                    "message": f"🔄 Fetching delay summary for route {user_selected_route}..."
+                }
+            })
+            
+            try:
+                # Call the tool again with selected route
+                tool_result = await mcp_client.invoke_tool(
+                    "get_delay_summary", 
+                    {**original_tool_args, "selected_route": user_selected_route}
+                )
+                
+                # Clear the context
+                route_selection_context.pop(thread_id, None)
+                
+                # Process and display the actual delay summary
+                if isinstance(tool_result, dict) and tool_result.get("ok"):
+                    delay_data = tool_result['data']
+                    
+                    # Format the delay summary nicely
+                    summary_parts = []
+                    summary_parts.append(f"**✈️ Delay Summary for {user_selected_route}**")
+                    summary_parts.append(f"**Flight:** {delay_data.get('flightLegState', {}).get('carrier', '')}{delay_data.get('flightLegState', {}).get('flightNumber', '')}")
+                    summary_parts.append(f"**Date:** {delay_data.get('flightLegState', {}).get('dateOfOrigin', '')}")
+                    summary_parts.append(f"**Route:** {delay_data.get('flightLegState', {}).get('startStation', '')} → {delay_data.get('flightLegState', {}).get('endStation', '')}")
+                    summary_parts.append(f"**Status:** {delay_data.get('flightLegState', {}).get('flightStatus', 'N/A')}")
+                    
+                    delays = delay_data.get('flightLegState', {}).get('delays', {})
+                    if delays:
+                        summary_parts.append("\n**Delays:**")
+                        if isinstance(delays, list):
+                            for delay in delays:
+                                if isinstance(delay, dict):
+                                    summary_parts.append(f"- Reason: {delay.get('reason', 'Unknown')}, Duration: {delay.get('duration', 'N/A')} minutes")
+                        elif isinstance(delays, dict):
+                            for key, value in delays.items():
+                                summary_parts.append(f"- {key}: {value}")
+                    
+                    formatted_summary = "\n".join(summary_parts)
+                    
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant",
+                            "content": formatted_summary
+                        }
+                    })
+                else:
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant", 
+                            "content": f"❌ Error fetching delay summary: {tool_result}"
+                        }
+                    })
+                    
+            except Exception as e:
+                yield sse_event({
+                    "type": "TEXT_MESSAGE_CONTENT", 
+                    "message": {
+                        "id": f"msg-{uuid.uuid4().hex[:8]}",
+                        "role": "assistant",
+                        "content": f"❌ Error processing route selection: {str(e)}"
+                    }
+                })
+            
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # --- CASE 2: New Query (Normal Flow)
+        if not user_query.strip():
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT", 
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "content": "Please enter your query about flight delays."
+                }
+            })
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "thinking", 
+                "progress_pct": 5,
+                "message": "🧠 Analyzing your flight query..."
+            }
+        })
+
+        # Ensure MCP connection
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connect failed: {e}"})
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # --- PLAN (THINKING phase)
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "thinking", 
+                "progress_pct": 15,
+                "message": "📋 Planning which flight data tools to use..."
+            }
+        })
+        
+        try:
+            plan_data = await loop.run_in_executor(None, mcp_client.plan_tools, user_query)
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"Planner error: {e}"})
+            return
+
+        plan = plan_data.get("plan", []) if isinstance(plan_data, dict) else []
+        
+        if not plan:
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT", 
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "content": "I couldn't generate a valid plan for your query. Please try rephrasing."
+                }
+            })
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # --- PROCESSING: Tool execution
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "processing", 
+                "progress_pct": 20,
+                "message": f"🛠️ Executing {len(plan)} flight data tools..."
+            }
+        })
+
+        current_progress = 20.0
+        per_step = 60.0 / max(1, len(plan))
+
+        for step_index, step in enumerate(plan):
+            if await request.is_disconnected():
+                return
+
+            tool_name = step.get("tool")
+            args = step.get("arguments", {}) or {}
+
+            yield sse_event({
+                "type": "STATE_UPDATE", 
+                "state": {
+                    "phase": "processing",
+                    "progress_pct": round(current_progress),
+                    "message": f"🔧 Running {tool_name}..."
+                }
             })
 
-        return response_ok({"count": len(options), "options": options})
+            try:
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+                
+                # Check if multiple routes are available (for delay summary)
+                if (tool_name == "get_delay_summary" and 
+                    isinstance(tool_result, dict) and 
+                    tool_result.get("ok") and 
+                    tool_result.get("data", {}).get("status") == "route_selection_required"):
+                    
+                    # Store context for route selection
+                    route_data = tool_result["data"]
+                    route_selection_context[thread_id] = {
+                        "available_routes": route_data["available_routes"],
+                        "original_args": args
+                    }
+                    
+                    # Format route options for display
+                    route_options = []
+                    for idx, route in enumerate(route_data["available_routes"]):
+                        route_options.append(
+                            f"**{idx+1}. {route['startStation']} → {route['endStation']}**\n"
+                            f"   - Time: {route.get('scheduledStartTime', 'Unknown')}\n"
+                            f"   - Status: {route['flightStatus']}"
+                        )
+                    
+                    route_message = "\n\n".join(route_options)
+                    
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant",
+                            "content": f"**🛫 Multiple Routes Found!**\n\n"
+                                      f"{route_message}\n\n"
+                                      f"**Please select a route by entering the number (1-{len(route_data['available_routes']}):**"
+                        }
+                    })
+                    
+                    # Stop further processing - wait for user route selection
+                    yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+                    yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+                    return
+                    
+                else:
+                    # Normal tool result - continue with summarization
+                    # (We'll handle single route case in summarization)
+                    pass
+                    
+            except Exception as exc:
+                logger.error(f"Tool {tool_name} failed: {exc}")
 
-    except Exception as exc:
-        logger.exception("get_delay_summary failed")
-        return response_error(f"get_delay_summary failed: {str(exc)}", 500)
+            current_progress = min(80.0, 20.0 + per_step * (step_index + 1))
+
+        # --- TYPING: Result generation (only for single route cases)
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "typing", 
+                "progress_pct": 85,
+                "message": "✍️ Generating your flight analysis..."
+            }
+        })
+
+        try:
+            # Re-fetch all tool results for summarization
+            results = []
+            for step in plan:
+                tool_name = step.get("tool")
+                args = step.get("arguments", {}) or {}
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+                results.append({tool_name: tool_result})
+            
+            summary_data = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
+            assistant_text = summary_data.get("summary", "") if isinstance(summary_data, dict) else str(summary_data)
+        except Exception as e:
+            assistant_text = f"❌ Failed to summarize results: {e}"
+
+        # Stream summary as chunks
+        msg_id = f"msg-{uuid.uuid4().hex[:8]}"
+        
+        yield sse_event({
+            "type": "TEXT_MESSAGE_CONTENT",
+            "message": {
+                "id": msg_id,
+                "role": "assistant",
+                "content": ""
+            }
+        })
+
+        chunks = chunk_text(assistant_text, max_len=150)
+        for i, chunk in enumerate(chunks):
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT",
+                "message": {
+                    "id": msg_id,
+                    "role": "assistant", 
+                    "delta": chunk
+                }
+            })
+            
+            typing_progress = 85 + (i / len(chunks)) * 15
+            yield sse_event({
+                "type": "STATE_UPDATE",
+                "state": {
+                    "phase": "typing",
+                    "progress_pct": round(typing_progress),
+                    "message": "✍️ Generating your flight analysis..."
+                }
+            })
+            
+            await asyncio.sleep(0.03)
+
+        # Final state
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+        yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return response_error(f"Database error: {str(e)}", 500)
