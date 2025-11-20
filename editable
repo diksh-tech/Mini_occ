@@ -1,0 +1,123 @@
+from bson import ObjectId  # add at top of file if not already present
+
+@mcp.tool()
+async def get_delay_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "", option_id: str = "") -> str:
+    """
+    Enhanced get_delay_summary with counting + options behavior.
+
+    - If option_id is provided, try to fetch that specific document and return its full delay info.
+    - Otherwise, count matching docs:
+        * 0 -> return 404
+        * 1 -> return full document (legacy behavior)
+        * >1 -> return compact list of options for the UI to present
+    """
+    logger.info(f"get_delay_summary: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}, option_id={option_id}")
+    try:
+        fn = normalize_flight_number(flight_number) if flight_number else None
+        dob = validate_date(date_of_origin) if date_of_origin else None
+
+        if date_of_origin and not dob:
+            return response_error("Invalid date_of_origin format.", 400)
+
+        query = make_query(carrier, fn, dob)
+        _, _, col = await get_mongodb_client()
+
+        # If option_id provided -> try direct fetch (prefer _id if valid)
+        if option_id:
+            # try treat as ObjectId
+            doc = None
+            try:
+                if ObjectId.is_valid(option_id):
+                    doc = await col.find_one({"_id": ObjectId(option_id)})
+            except Exception:
+                doc = None
+
+            # fallback to seq-based option_id like "CARRIER#FLIGHT#YYYY-MM-DD#SEQ"
+            if not doc:
+                parts = option_id.split("#")
+                if len(parts) >= 4:
+                    opt_carrier, opt_flight, opt_date, opt_seq = parts[0], parts[1], parts[2], parts[3]
+                    q2 = {
+                        "flightLegState.carrier": opt_carrier,
+                        "flightLegState.flightNumber": int(opt_flight) if str(opt_flight).isdigit() else opt_flight,
+                        "flightLegState.dateOfOrigin": opt_date,
+                        "flightLegState.seqNumber": int(opt_seq) if str(opt_seq).isdigit() else opt_seq
+                    }
+                    doc = await col.find_one(q2)
+
+            if not doc:
+                return response_error("No document found for provided option_id.", 404)
+
+            # clean and return full doc
+            doc.pop("_id", None)
+            doc.pop("_class", None)
+            return response_ok(doc)
+
+        # No option_id: count matching documents
+        # Use count_documents — ensure you have appropriate indexes for performance
+        try:
+            count = await col.count_documents(query)
+        except Exception:
+            # fallback: fast existence check + small scan
+            cursor = col.find(query).limit(2)
+            docs_tmp = []
+            async for d in cursor:
+                docs_tmp.append(d)
+            count = len(docs_tmp)
+
+        if count == 0:
+            return response_error("No matching document found for given query.", 404)
+
+        # If only one document -> fetch full doc and return (legacy behavior)
+        if count == 1:
+            # fetch full doc
+            full_doc = await col.find_one(query)
+            if not full_doc:
+                return response_error("Could not fetch document.", 500)
+            full_doc.pop("_id", None)
+            full_doc.pop("_class", None)
+            return response_ok(full_doc)
+
+        # If multiple documents -> return compact options for UI
+        projection = {
+            "_id": 1,
+            "flightLegState.carrier": 1,
+            "flightLegState.flightNumber": 1,
+            "flightLegState.dateOfOrigin": 1,
+            "flightLegState.seqNumber": 1,
+            "flightLegState.startStation": 1,
+            "flightLegState.endStation": 1,
+            "flightLegState.startStationICAO": 1,
+            "flightLegState.endStationICAO": 1,
+            "flightLegState.scheduledStartTime": 1,
+            "flightLegState.scheduledEndTime": 1,
+            "flightLegState.delays": 1
+        }
+
+        cursor = col.find(query, projection).sort("flightLegState.seqNumber", 1).limit(50)
+        options = []
+        async for d in cursor:
+            fl = d.get("flightLegState", {}) or {}
+            _id_str = str(d.get("_id")) if d.get("_id") else None
+            option_id_det = f"{fl.get('carrier') or ''}#{fl.get('flightNumber') or ''}#{fl.get('dateOfOrigin') or ''}#{fl.get('seqNumber') or ''}"
+            options.append({
+                "_id": _id_str,                      # stringified Mongo id (server can accept later)
+                "option_id": option_id_det,          # deterministic id for UI
+                "carrier": fl.get("carrier"),
+                "flightNumber": fl.get("flightNumber"),
+                "dateOfOrigin": fl.get("dateOfOrigin"),
+                "seqNumber": fl.get("seqNumber"),
+                "startStation": fl.get("startStation"),
+                "endStation": fl.get("endStation"),
+                "startStationICAO": fl.get("startStationICAO"),
+                "endStationICAO": fl.get("endStationICAO"),
+                "scheduledStartTime": fl.get("scheduledStartTime"),
+                "scheduledEndTime": fl.get("scheduledEndTime"),
+                "delay_summary": (fl.get("delays") or {}).get("total") if isinstance(fl.get("delays", {}), dict) else None
+            })
+
+        return response_ok({"count": len(options), "options": options})
+
+    except Exception as exc:
+        logger.exception("get_delay_summary failed")
+        return response_error(f"get_delay_summary failed: {str(exc)}", 500)
