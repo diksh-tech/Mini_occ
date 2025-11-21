@@ -19,7 +19,7 @@ MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/"
 # Azure OpenAI configuration
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
 AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
 
 if not AZURE_OPENAI_KEY:
@@ -35,7 +35,9 @@ client_azure = AzureOpenAI(
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-
+# ---------------------------------------------------------------------
+#  SYSTEM PROMPTS
+# ---------------------------------------------------------------------
 def _build_tool_prompt() -> str:
     """Convert TOOLS dict into compact text to feed the LLM."""
     lines = []
@@ -149,18 +151,6 @@ Flight documents contain(Schema):
     'flight_plan_hold_fuel':'flightLegState.operation.flightPlan.holdFuel',
     'flight_plan_hold_time':'flightLegState.operation.flightPlan.holdTime',
     'flight_plan_route_distance':'flightLegState.operation.flightPlan.routeDistance',
-    'start_country':'flightLegState.startCountry',
-    'end_country':'flightLegState.endCountry',
-    'ICAO_start_station':'flightLegState.startStationICAO',
-    'ICAO_end_station':'flightLegState.endStationICAO',
-    'Flight_otp_achieved':'flightLegState.isOTPAchieved',
-    'Flight_otp_considered':'flightLegState.isOTPConsidered',
-    'Flight_otp_status':'flightLegState.isOTPFlight',
-    'Flight_type':'flightLegState.flightType',
-    'scheduled_block_time':'flightLegState.blockTimeSch',
-    'acutal_block_time':'flightLegState.blockTimeActual',
-    'start_time_offset':'flightLegState.startTimeOffset',
-    'end_time_offset':'flightLegState.endTimeOffset',
 
 ---
 
@@ -168,14 +158,14 @@ Flight documents contain(Schema):
 - Only include fields relevant to the question.
 - Always exclude "_id".
 - Examples:
-  - “passenger” → include flightNumber, pax.passengerCount
-  - “delay” or “reason” → include flightNumber, delays.total, delays.delay.reason
-  - “aircraft” or “tail” → include equipment.aircraftRegistration, aircraft.type
-  - “station” or “sector” → include startStation, endStation, terminals
-  - “crew” → include crewConnections.crew.givenName, position
-  - “timing / departure / arrival / dep / arr” → include scheduledStartTime, scheduledEndTime, operation.actualTimes
-  - “fuel” → include operation.fuel
-  - “OTP” or “on-time” → include isOTPAchieved, flightStatus
+  - "passenger" → include flightNumber, pax.passengerCount
+  - "delay" or "reason" → include flightNumber, delays.total, delays.delay.reason
+  - "aircraft" or "tail" → include equipment.aircraftRegistration, aircraft.type
+  - "station" or "sector" → include startStation, endStation, terminals
+  - "crew" → include crewConnections.crew.givenName, position
+  - "timing / departure / arrival / dep / arr" → include scheduledStartTime, scheduledEndTime, operation.actualTimes
+  - "fuel" → include operation.fuel
+  - "OTP" or "on-time" → include isOTPAchieved, flightStatus
 
 ---
 
@@ -186,36 +176,24 @@ Flight documents contain(Schema):
 4. Never return "_id" in projections.
 5. For numerical summaries → use run_aggregated_query.
 6. For filtered listings → use raw_mongodb_query.
-7. for StartTimeOffset and EndTimeOffset → use run_aggregated_query.
-6. latest date in the database is 2025-05-30 and consider it today's date
 """
 
 
 SYSTEM_PROMPT_SUMMARIZE = """
 You are an assistant that summarizes tool outputs into a concise, readable answer.
-Be factual, short, bullet points format and helpful. 
-You are an assistant that summarizes tool outputs into a concise, readable answer.
-Be factual, short, bullet points format and helpful.
-
-  Do this for both run_aggregate_query and get_basic_flight_info and for other also
-  IMPORTANT FORMATTING RULES:
-- Structure information as bullet points
-- Keep responses factual and professional
-- Use proper spacing and line breaks for readability
-- do not use code blocks for field vlaues just make it bold
-- do the clean structuring in this way:-(notice how i have removed asterik '*')
-   
-   ⏰ **Scheduled Arrival Time**: **11:30 AM**  ->  Scheduled Arrival Time: 11:30 AM
+Be factual, short, and helpful.
 """
 
-
+# ---------------------------------------------------------------------
+#  FLIGHTOPS MCP CLIENT CLASS
+# ---------------------------------------------------------------------
 class FlightOpsMCPClient:
     def __init__(self, base_url: str = None):
         self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
         self.session: ClientSession = None
         self._client_context = None
 
-    
+    # -------------------- CONNECTION HANDLERS -------------------------
     async def connect(self):
         try:
             logger.info(f"Connecting to MCP server at {self.base_url}")
@@ -240,7 +218,7 @@ class FlightOpsMCPClient:
             logger.error(f"Error during disconnect: {e}")
 
     # -------------------- AZURE OPENAI WRAPPER -------------------------
-    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> dict:
         try:
             completion = client_azure.chat.completions.create(
                 model=AZURE_OPENAI_DEPLOYMENT,
@@ -248,10 +226,21 @@ class FlightOpsMCPClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            return completion.choices[0].message.content
+            usage_obj = getattr(completion, "usage", None)
+            usage = None
+            if usage_obj is not None:
+                usage = {
+                    "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
+                }
+            return {
+                "content": completion.choices[0].message.content,
+                "usage": usage
+            }
         except Exception as e:
             logger.error(f"Azure OpenAI API error: {e}")
-            return json.dumps({"error": str(e)})
+            return {"content": json.dumps({"error": str(e)}), "usage": None}
 
     # -------------------- MCP TOOL CALLS -------------------------
     async def list_tools(self) -> dict:
@@ -270,7 +259,7 @@ class FlightOpsMCPClient:
             if not self.session:
                 await self.connect()
             logger.info(f"Calling tool: {tool_name} with args: {args}")
-            result = await self.session.call_tool(tool_name, args)  
+            result = await self.session.call_tool(tool_name, args)
 
             if result.content:
                 content_items = []
@@ -291,46 +280,39 @@ class FlightOpsMCPClient:
 
     # -------------------- LLM PLANNING & SUMMARIZATION -------------------------
     def plan_tools(self, user_query: str) -> dict:
-        """
-        Ask the LLM to produce a valid JSON plan for which MCP tools to call.
-        Cleans out Markdown-style fences (```json ... ```), which some models add.`````
-        """
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT_PLAN},
             {"role": "user", "content": user_query},
         ]
 
-        content = self._call_azure_openai(messages, temperature=0.1)
+        res = self._call_azure_openai(messages, temperature=0.1)
+        content = res.get("content")
+        plan_usage = res.get("usage")
+        
         if not content:
             logger.warning("⚠️ LLM returned empty response during plan generation.")
-            return {"plan": []}
+            return {"plan": [], "llm_usage": plan_usage}
 
-        
         cleaned = content.strip()
         if cleaned.startswith("```"):
-            
             cleaned = cleaned.strip("`")
             if cleaned.lower().startswith("json"):
                 cleaned = cleaned[4:].strip()
-            
             cleaned = cleaned.replace("```", "").strip()
 
-        
         if cleaned != content:
             logger.debug(f"🔍 Cleaned LLM plan output:\n{cleaned}")
 
-       
         try:
             plan = json.loads(cleaned)
             if isinstance(plan, dict) and "plan" in plan:
-                return plan
+                return {"plan": plan["plan"], "llm_usage": plan_usage}
             else:
                 logger.warning("⚠️ LLM output did not contain 'plan' key.")
-                return {"plan": []}
+                return {"plan": [], "llm_usage": plan_usage}
         except json.JSONDecodeError:
             logger.warning(f"❌ Could not parse LLM plan output after cleaning:\n{cleaned}")
-            return {"plan": []}
-
+            return {"plan": [], "llm_usage": plan_usage}
 
     def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
         messages = [
@@ -339,47 +321,80 @@ class FlightOpsMCPClient:
             {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
             {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
         ]
-        summary = self._call_azure_openai(messages, temperature=0.3)
-        return {"summary": summary}
+        res = self._call_azure_openai(messages, temperature=0.3)
+        return {"summary": res.get("content"), "llm_usage": res.get("usage")}
 
-   
     async def run_query(self, user_query: str) -> dict:
         """
-        Full flow:
-        1. LLM plans which tools to call (including possible MongoDB query).
-        2. Execute tools sequentially via MCP.
-        3. Summarize results using LLM.
+        Full flow with proper token tracking for cost monitoring
         """
         try:
             logger.info(f"User query: {user_query}")
             plan_data = self.plan_tools(user_query)
             plan = plan_data.get("plan", [])
+            planning_usage = plan_data.get("llm_usage")
+            
             if not plan:
-                return {"error": "LLM did not produce a valid tool plan."}
+                return {
+                    "error": "LLM did not produce a valid tool plan.",
+                    "token_usage": {
+                        "planning": planning_usage,
+                        "summarization": None,
+                        "total": planning_usage
+                    }
+                }
 
+            # Execute the plan
             results = []
             for step in plan:
                 tool = step.get("tool")
                 args = step.get("arguments", {})
-
+                
                 # Clean up bad args
                 args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
 
-                # Safety for MongoDB query
                 if tool == "raw_mongodb_query":
                     query_json = args.get("query_json", "")
                     if not query_json:
                         results.append({"raw_mongodb_query": {"error": "Empty query_json"}})
                         continue
-                    # Enforce safe default limit
                     args["limit"] = int(args.get("limit", 50))
                     logger.info(f"Executing raw MongoDB query: {query_json}")
 
                 resp = await self.invoke_tool(tool, args)
                 results.append({tool: resp})
 
-            summary = self.summarize_results(user_query, plan, results)
-            return {"plan": plan, "results": results, "summary": summary}
+            # Summarize results
+            summary_data = self.summarize_results(user_query, plan, results)
+            summarization_usage = summary_data.get("llm_usage")
+
+            # Calculate total tokens for cost tracking
+            def safe_int(value):
+                try:
+                    return int(value) if value is not None else 0
+                except (ValueError, TypeError):
+                    return 0
+
+            total_tokens = {
+                "prompt_tokens": safe_int(planning_usage and planning_usage.get("prompt_tokens")) + 
+                                safe_int(summarization_usage and summarization_usage.get("prompt_tokens")),
+                "completion_tokens": safe_int(planning_usage and planning_usage.get("completion_tokens")) + 
+                                    safe_int(summarization_usage and summarization_usage.get("completion_tokens")),
+                "total_tokens": safe_int(planning_usage and planning_usage.get("total_tokens")) + 
+                               safe_int(summarization_usage and summarization_usage.get("total_tokens"))
+            }
+
+            return {
+                "plan": plan,
+                "results": results,
+                "summary": {"summary": summary_data.get("summary")},
+                "token_usage": {
+                    "planning": planning_usage,
+                    "summarization": summarization_usage,
+                    "total": total_tokens
+                }
+            }
+            
         except Exception as e:
             logger.error(f"Error in run_query: {e}")
             return {"error": str(e)}
