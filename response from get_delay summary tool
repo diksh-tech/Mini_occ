@@ -1,0 +1,4 @@
+**✈️ Delay Summary for SXR-BOM** **Flight:** 6E215 **Date:** 2024-06-23 **Route:** SXR → BOM **Status:** **Delays:** - delay: [{'time': 'PT47M', 'reason': 'RAU', 'delayNumber': 1, 'isRootCause': False, 'remark': 'late arrival'}, {'time': 'PT6M', 'reason': 'RAM', 'delayNumber': 2, 'isRootCause': False, 'remark': 'De boarding of PRM pax took time from the aircraft'}] - total: PT53M
+
+
+**🛫 Multiple Routes Found!** **1. DEL → BOM** - Time: 2024-06-23T09:30:00 - Status: LANDED **2. SXR → BOM** - Time: 2024-06-23T14:30:00Z - Status: **Please select a route by entering the number (1-2):**
