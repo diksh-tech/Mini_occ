@@ -14,9 +14,14 @@ export default function ChatPage() {
     const [input, setInput] = useState("");
     const [loading, setLoading] = useState(false);
     const [agentState, setAgentState] = useState({
-        phase: 'idle', // 'thinking' | 'processing' | 'typing' | 'finished' | 'idle'
+        phase: 'idle',
         progress: 0,
         message: ''
+    });
+    const [tokenUsage, setTokenUsage] = useState({
+        planning: null,
+        summarization: null,
+        total: null
     });
     const messagesEndRef = useRef(null);
 
@@ -40,11 +45,15 @@ export default function ChatPage() {
         setLoading(true);
         setInput("");
         
-        // Reset agent state
         setAgentState({
             phase: 'thinking',
             progress: 0,
             message: 'Starting analysis...'
+        });
+        setTokenUsage({
+            planning: null,
+            summarization: null,
+            total: null
         });
 
         const body = {
@@ -88,15 +97,17 @@ export default function ChatPage() {
 
                             try {
                                 const event = JSON.parse(payload);
+                                console.log("SSE Event:", event.type, event); // Debug logging
                                 handleEvent(event, currentMessageId);
                             } catch (err) {
-                                console.warn("Bad SSE line:", payload);
+                                console.warn("Bad SSE line:", payload, err);
                             }
                         }
                     }
                 }
             }
         } catch (err) {
+            console.error("Error in sendMessage:", err);
             setMessages((prev) => [
                 ...prev,
                 { 
@@ -114,6 +125,8 @@ export default function ChatPage() {
     function handleEvent(event, currentMessageId) {
         const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         
+        console.log("Processing event:", event.type); // Debug logging
+        
         switch (event.type) {
             case "STATE_UPDATE":
                 setAgentState(event.state);
@@ -121,7 +134,6 @@ export default function ChatPage() {
                 
             case "TEXT_MESSAGE_CONTENT":
                 if (event.message) {
-                    // Handle streaming text with deltas
                     if (event.message.delta) {
                         setMessages(prev => {
                             const existingIdx = prev.findIndex(m => m.id === event.message.id);
@@ -140,7 +152,6 @@ export default function ChatPage() {
                             }
                         });
                     } else if (event.message.content) {
-                        // Complete message
                         setMessages(prev => [...prev, {
                             id: event.message.id,
                             role: event.message.role,
@@ -149,7 +160,6 @@ export default function ChatPage() {
                         }]);
                     }
                 } else if (event.content) {
-                    // Legacy format
                     setMessages(prev => [...prev, {
                         role: "assistant",
                         content: event.content,
@@ -166,13 +176,21 @@ export default function ChatPage() {
                 }]);
                 break;
                 
-            case "TOOL_CALL_RESULT":
-                // Optional: show tool results in UI
-                // setMessages(prev => [...prev, {
-                //     role: "system", 
-                //     content: `✅ ${event.toolCallName} completed`,
-                //     timestamp: timestamp
-                // }]);
+            case "TOKEN_USAGE":
+                console.log("TOKEN_USAGE event received:", event.phase, event.usage);
+                setTokenUsage(prev => ({
+                    ...prev,
+                    [event.phase]: event.usage
+                }));
+                
+                // Also show token usage as a system message for visibility
+                if (event.phase === 'total' && event.usage) {
+                    setMessages(prev => [...prev, {
+                        role: "system",
+                        content: `📊 Token Usage: ${event.usage.total_tokens || 0} total (${event.usage.prompt_tokens || 0} prompt + ${event.usage.completion_tokens || 0} completion)`,
+                        timestamp: timestamp
+                    }]);
+                }
                 break;
                 
             case "RUN_FINISHED":
@@ -189,19 +207,20 @@ export default function ChatPage() {
                 break;
                 
             default:
+                console.log('Unhandled event type:', event.type);
                 break;
         }
     }
 
-    // Status indicator component
     const StatusIndicator = () => {
-        if (agentState.phase === 'idle') return null;
+        if (agentState.phase === 'idle' && !tokenUsage.total) return null;
         
         const phaseIcons = {
             thinking: '🧠',
             processing: '🛠️', 
             typing: '✍️',
-            finished: '✅'
+            finished: '✅',
+            idle: '✅'
         };
         
         return (
@@ -209,6 +228,21 @@ export default function ChatPage() {
                 <div className="status-content">
                     <span className="status-icon">{phaseIcons[agentState.phase]}</span>
                     <span className="status-message">{agentState.message}</span>
+                    
+                    {/* Token Usage Display */}
+                    {tokenUsage.total && (
+                        <div className="token-usage">
+                            <div className="token-breakdown">
+                                <span className="token-label">Total Tokens: </span>
+                                <span className="token-value">{tokenUsage.total.total_tokens || 0}</span>
+                            </div>
+                            <div className="token-details">
+                                <span>Prompt: {tokenUsage.total.prompt_tokens || 0}</span>
+                                <span>Completion: {tokenUsage.total.completion_tokens || 0}</span>
+                            </div>
+                        </div>
+                    )}
+                    
                     {agentState.progress > 0 && (
                         <div className="progress-bar">
                             <div 
