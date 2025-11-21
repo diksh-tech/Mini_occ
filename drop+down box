@@ -1,0 +1,2534 @@
+# server.py
+import os
+import logging
+import json
+from typing import Optional, Any, Dict, List
+from datetime import datetime
+from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
+load_dotenv() 
+
+from mcp.server.fastmcp import FastMCP
+
+HOST = os.getenv("MCP_HOST", "127.0.0.1")
+PORT = int(os.getenv("MCP_PORT", "8000"))
+TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
+
+MONGODB_URL = os.getenv("MONGO_URI")
+DATABASE_NAME = os.getenv("MONGO_DB")
+COLLECTION_NAME = os.getenv("MONGO_COLLECTION")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("flightops.mcp.server")
+
+mcp = FastMCP("FlightOps MCP Server")
+
+_mongo_client: Optional[AsyncIOMotorClient] = None
+_db = None
+_col = None
+
+async def get_mongodb_client():
+    """Initialize and return the global Motor client, DB and collection."""
+    global _mongo_client, _db, _col
+    if _mongo_client is None:
+        logger.info("Connecting to MongoDB: %s", MONGODB_URL)
+        _mongo_client = AsyncIOMotorClient(
+            MONGODB_URL,
+            maxPoolSize=10,
+            minPoolSize=1,
+            maxIdleTimeMS=30000,
+            serverSelectionTimeoutMS=5000
+        )
+        _db = _mongo_client[DATABASE_NAME]
+        _col = _db[COLLECTION_NAME]
+        
+        # Test connection
+        try:
+            await _mongo_client.admin.command('ping')
+            logger.info("✅ MongoDB connection successful")
+        except Exception as e:
+            logger.error(f"❌ MongoDB connection failed: {e}")
+            raise
+    return _mongo_client, _db, _col
+
+async def _check_connection():
+    """Check if MongoDB connection is alive."""
+    try:
+        if _mongo_client:
+            await _mongo_client.admin.command('ping')
+            return True
+    except Exception:
+        return False
+    return False
+
+def normalize_flight_number(flight_number: Any) -> Optional[int]:
+    """Convert flight_number to int. MongoDB stores it as int."""
+    if flight_number is None or flight_number == "":
+        return None
+    if isinstance(flight_number, int):
+        return flight_number
+    try:
+        return int(str(flight_number).strip())
+    except (ValueError, TypeError):
+        logger.warning(f"Could not normalize flight_number: {flight_number}")
+        return None
+
+def validate_date(date_str: str) -> Optional[str]:
+    """
+    Validate date_of_origin string. Accepts common formats.
+    Returns normalized ISO date string YYYY-MM-DD if valid, else None.
+    """
+    if not date_str or date_str == "":
+        return None
+    
+    # Handle common date formats
+    formats = [
+        "%Y-%m-%d",      # 2024-06-23
+        "%d-%m-%Y",      # 23-06-2024
+        "%Y/%m/%d",      # 2024/06/23
+        "%d/%m/%Y",      # 23/06/2024
+        "%B %d, %Y",     # June 23, 2024
+        "%d %B %Y",      # 23 June 2024
+        "%b %d, %Y",     # Jun 23, 2024
+        "%d %b %Y"       # 23 Jun 2024
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    
+    logger.warning(f"Could not parse date: {date_str}")
+    return None
+
+def make_query(carrier: str, flight_number: Optional[int], date_of_origin: str) -> Dict:
+    """
+    Build MongoDB query matching the actual database schema.
+    """
+    query = {}
+    
+    # Add carrier if provided
+    if carrier:
+        query["flightLegState.carrier"] = carrier
+    
+    # Add flight number as integer (as stored in DB)
+    if flight_number is not None:
+        query["flightLegState.flightNumber"] = flight_number
+    
+    # Add date if provided
+    if date_of_origin:
+        query["flightLegState.dateOfOrigin"] = date_of_origin
+    
+    logger.info(f"Built query: {json.dumps(query)}")
+    return query
+
+def response_ok(data: Any) -> str:
+    """Return JSON string for successful response."""
+    return json.dumps({"ok": True, "data": data}, indent=2, default=str)
+
+def response_error(msg: str, code: int = 400, details: dict = None) -> str:
+    """Return JSON string for error response with additional details."""
+    error_data = {
+        "ok": False, 
+        "error": {
+            "message": msg, 
+            "code": code,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    }
+    if details:
+        error_data["error"]["details"] = details
+    return json.dumps(error_data, indent=2)
+
+def format_time_for_display(time_str: str) -> str:
+    """Format time string for user-friendly display."""
+    if not time_str or time_str == "Unknown":
+        return "Unknown"
+    
+    try:
+        if "T" in time_str:
+            dt = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+            return dt.strftime("%I:%M %p")
+        return time_str
+    except Exception:
+        return time_str
+
+async def _fetch_one_async(query: dict, projection: dict) -> str:
+    """
+    Consistent async DB fetch and error handling.
+    Returns JSON string response.
+    """
+    try:
+        _, _, col = await get_mongodb_client()
+        logger.info(f"Executing query: {json.dumps(query)}")
+        
+        result = await col.find_one(query, projection)
+        
+        if not result:
+            logger.warning(f"No document found for query: {json.dumps(query)}")
+            return response_error("No matching document found.", code=404)
+        
+        # Remove _id and _class to keep output clean
+        if "_id" in result:
+            result.pop("_id")
+        if "_class" in result:
+            result.pop("_class")
+        
+        logger.info(f"Query successful")
+        return response_ok(result)
+    except Exception as exc:
+        logger.exception("DB query failed")
+        return response_error(f"DB query failed: {str(exc)}", code=500)
+
+def format_delay_summary_professional(flight_data: dict, selected_route: str) -> str:
+    """
+    Format delay summary in a professional, user-friendly way without markdown.
+    """
+    try:
+        # Extract flight information
+        carrier = flight_data.get("carrier", "Unknown")
+        flight_number = flight_data.get("flightNumber", "Unknown")
+        date_of_origin = flight_data.get("dateOfOrigin", "Unknown")
+        start_station = flight_data.get("startStation", "Unknown")
+        end_station = flight_data.get("endStation", "Unknown")
+        flight_status = flight_data.get("flightStatus", "Unknown")
+        scheduled_time = flight_data.get("scheduledStartTime", "Unknown")
+        
+        # Format scheduled time if it's in ISO format
+        if scheduled_time != "Unknown":
+            try:
+                if "T" in scheduled_time:
+                    dt = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+                    scheduled_time = dt.strftime("%I:%M %p, %b %d, %Y")
+            except:
+                pass
+        
+        # Extract delays information
+        delays = flight_data.get("delays", {})
+        delay_list = []
+        total_delay = "0 minutes"
+        
+        # Parse delays based on different possible structures
+        if isinstance(delays, dict):
+            delay_list = delays.get("delay", [])
+            total_delay = delays.get("total", "PT0M")
+        elif isinstance(delays, list):
+            delay_list = delays
+        
+        # Convert ISO duration to readable format
+        def parse_duration(duration_str):
+            """Convert PT53M to 53 minutes, PT1H30M to 1 hour 30 minutes, etc."""
+            if not duration_str or not isinstance(duration_str, str):
+                return "0 minutes"
+            
+            try:
+                # Remove 'PT' prefix
+                if duration_str.startswith('PT'):
+                    duration_str = duration_str[2:]
+                
+                hours = 0
+                minutes = 0
+                
+                # Check for hours
+                if 'H' in duration_str:
+                    hours_part = duration_str.split('H')[0]
+                    hours = int(hours_part) if hours_part.isdigit() else 0
+                    duration_str = duration_str.split('H')[-1]
+                
+                # Check for minutes
+                if 'M' in duration_str:
+                    minutes_part = duration_str.split('M')[0]
+                    minutes = int(minutes_part) if minutes_part.isdigit() else 0
+                
+                if hours > 0 and minutes > 0:
+                    return f"{hours} hour{'s' if hours > 1 else ''} {minutes} minute{'s' if minutes > 1 else ''}"
+                elif hours > 0:
+                    return f"{hours} hour{'s' if hours > 1 else ''}"
+                elif minutes > 0:
+                    return f"{minutes} minute{'s' if minutes > 1 else ''}"
+                else:
+                    return "0 minutes"
+                    
+            except Exception:
+                return duration_str  # Return original if parsing fails
+        
+        # Format total delay
+        total_delay_readable = parse_duration(total_delay)
+        
+        # Build professional summary without markdown
+        summary_parts = []
+        
+        # Header
+        summary_parts.append("🛬 FLIGHT DELAY ANALYSIS REPORT")
+        summary_parts.append("")
+        
+        # Flight Information
+        summary_parts.append("FLIGHT DETAILS")
+        summary_parts.append(f"Flight: {carrier}{flight_number}")
+        summary_parts.append(f"Date: {date_of_origin}")
+        summary_parts.append(f"Route: {start_station} → {end_station}")
+        summary_parts.append(f"Scheduled Time: {scheduled_time}")
+        summary_parts.append(f"Status: {flight_status}")
+        summary_parts.append("")
+        
+        # Delay Summary
+        summary_parts.append("DELAY SUMMARY")
+        summary_parts.append(f"Total Delay Duration: {total_delay_readable}")
+        summary_parts.append("")
+        
+        # Individual Delays
+        if delay_list:
+            summary_parts.append("DETAILED DELAY BREAKDOWN")
+            
+            for i, delay in enumerate(delay_list, 1):
+                if isinstance(delay, dict):
+                    reason = delay.get('reason', 'Unknown Reason')
+                    duration = parse_duration(delay.get('time', 'PT0M'))
+                    remark = delay.get('remark', 'No additional remarks')
+                    delay_number = delay.get('delayNumber', i)
+                    is_root_cause = delay.get('isRootCause', False)
+                    
+                    summary_parts.append(f"{i}. Delay #{delay_number}")
+                    summary_parts.append(f"   Reason: {reason}")
+                    summary_parts.append(f"   Duration: {duration}")
+                    summary_parts.append(f"   Remarks: {remark}")
+                    if is_root_cause:
+                        summary_parts.append(f"   Impact: Root Cause Delay")
+                    summary_parts.append("")
+        else:
+            summary_parts.append("No individual delay records found.")
+            summary_parts.append("")
+        
+        # Operational Impact
+        summary_parts.append("OPERATIONAL IMPACT")
+        if total_delay_readable != "0 minutes":
+            summary_parts.append(f"• This flight experienced a total delay of {total_delay_readable}")
+            if delay_list:
+                summary_parts.append(f"• {len(delay_list)} delay event{'s' if len(delay_list) > 1 else ''} were recorded")
+            summary_parts.append("• Delays may impact connecting flights and ground operations")
+        else:
+            summary_parts.append("• No significant delays recorded for this flight")
+            summary_parts.append("• Operations were as per schedule")
+        
+        summary_parts.append("")
+        summary_parts.append("---")
+        summary_parts.append("Report generated by FlightOps Analytics")
+        
+        return "\n".join(summary_parts)
+        
+    except Exception as e:
+        logger.error(f"Error in professional formatting: {e}")
+        # Fallback to basic formatting
+        basic_summary = f"Delay Summary for {selected_route}\n"
+        basic_summary += f"Flight: {flight_data.get('carrier', '')}{flight_data.get('flightNumber', '')}\n"
+        basic_summary += f"Total Delay: {flight_data.get('delays', {}).get('total', 'PT0M')}"
+        return basic_summary
+
+# --- MCP Tools ---
+
+@mcp.tool()
+async def health_check() -> str:
+    """
+    Simple health check for orchestrators and clients.
+    Attempts a cheap DB ping.
+    """
+    try:
+        _, _, col = await get_mongodb_client()
+        doc = await col.find_one({}, {"_id": 1})
+        return response_ok({
+            "status": "ok", 
+            "db_connected": doc is not None,
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        logger.exception("Health check DB ping failed")
+        return response_error("DB unreachable", code=503)
+
+@mcp.tool()
+async def get_flight_basic_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Fetch basic flight information including carrier, flight number, date, stations, times, and status.
+    
+    Args:
+        carrier: Airline carrier code (e.g., "6E", "AI")
+        flight_number: Flight number as string (e.g., "215")
+        date_of_origin: Date in YYYY-MM-DD format (e.g., "2024-06-23")
+    """
+    logger.info(f"get_flight_basic_info: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    # Normalize inputs
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    if date_of_origin and not dob:
+        return response_error("Invalid date_of_origin format. Expected YYYY-MM-DD or common date formats", 400)
+    
+    query = make_query(carrier, fn, dob)
+    
+    # Project basic flight information
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.suffix": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.seqNumber": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.startStationICAO": 1,
+        "flightLegState.endStationICAO": 1,
+        "flightLegState.scheduledStartTime": 1,
+        "flightLegState.scheduledEndTime": 1,
+        "flightLegState.flightStatus": 1,
+        "flightLegState.operationalStatus": 1,
+        "flightLegState.flightType": 1,
+        "flightLegState.blockTimeSch": 1,
+        "flightLegState.blockTimeActual": 1,
+        "flightLegState.flightHoursActual": 1,
+        "flightLegState.isOTPFlight": 1,
+        "flightLegState.isOTPAchieved": 1,
+        "flightLegState.isOTPConsidered": 1,
+        "flightLegState.isOTTFlight": 1,
+        "flightLegState.isOTTAchievedFlight": 1,
+        "flightLegState.turnTimeFlightBeforeActual": 1,
+        "flightLegState.turnTimeFlightBeforeSch": 1
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_operation_times(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Return estimated and actual operation times for a flight including takeoff, landing, block times,StartTimeOffset, EndTimeOffset.
+    
+    Args:
+        carrier: Airline carrier code
+        flight_number: Flight number as string
+        date_of_origin: Date in YYYY-MM-DD format
+    """
+    logger.info(f"get_operation_times: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    if date_of_origin and not dob:
+        return response_error("Invalid date format.", 400)
+    
+    query = make_query(carrier, fn, dob)
+    
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.scheduledStartTime": 1,
+        "flightLegState.scheduledEndTime": 1,
+        "flightLegState.startTimeOffset": 1,
+        "flightLegState.endTimeOffset": 1,
+        "flightLegState.operation.estimatedTimes": 1,
+        "flightLegState.operation.actualTimes": 1,
+        "flightLegState.taxiOutTime": 1,
+        "flightLegState.taxiInTime": 1,
+        "flightLegState.blockTimeSch": 1,
+        "flightLegState.blockTimeActual": 1,
+        "flightLegState.flightHoursActual": 1,
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_equipment_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Get aircraft equipment details including aircraft type, registration (tail number), and configuration.
+    
+    Args:
+        carrier: Airline carrier code
+        flight_number: Flight number as string
+        date_of_origin: Date in YYYY-MM-DD format
+    """
+    logger.info(f"get_equipment_info: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    query = make_query(carrier, fn, dob)
+    
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.equipment.plannedAircraftType": 1,
+        "flightLegState.equipment.aircraft": 1,
+        "flightLegState.equipment.aircraftConfiguration": 1,
+        "flightLegState.equipment.aircraftRegistration": 1,
+        "flightLegState.equipment.assignedAircraftTypeIATA": 1,
+        "flightLegState.equipment.assignedAircraftTypeICAO": 1,
+        "flightLegState.equipment.assignedAircraftTypeIndigo": 1,
+        "flightLegState.equipment.assignedAircraftConfiguration": 1,
+        "flightLegState.equipment.tailLock": 1,
+        "flightLegState.equipment.onwardFlight": 1,
+        "flightLegState.equipment.actualOnwardFlight": 1
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_delay_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "", selected_route: str = "") -> str:
+    """
+    Summarize delay reasons, durations, and total delay time for a specific flight.
+    If multiple routes exist, returns route options for user selection.
+    
+    Args:
+        carrier: Airline carrier code (e.g., "6E", "AI")
+        flight_number: Flight number as string (e.g., "215")
+        date_of_origin: Date in YYYY-MM-DD format (e.g., "2024-06-23")
+        selected_route: Route in format "START_STATION-END_STATION" (optional, for when user selects from multiple options)
+    """
+    logger.info(f"get_delay_summary: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}, selected_route={selected_route}")
+    
+    # Normalize inputs
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    if date_of_origin and not dob:
+        return response_error("Invalid date_of_origin format. Expected YYYY-MM-DD or common date formats", 400)
+    
+    # Step 1: Build base query
+    base_query = make_query(carrier, fn, dob)
+    
+    try:
+        _, _, col = await get_mongodb_client()
+        
+        # Step 2: Count documents for this flight
+        count = await col.count_documents(base_query)
+        logger.info(f"Found {count} documents for query: {json.dumps(base_query)}")
+        
+        # Step 3: If multiple documents and no route selected, return route options ONLY
+        if count > 1 and not selected_route:
+            # Get detailed route information for better selection
+            cursor = col.find(base_query, {
+                "flightLegState.carrier": 1,
+                "flightLegState.flightNumber": 1,
+                "flightLegState.startStation": 1,
+                "flightLegState.endStation": 1,
+                "flightLegState.scheduledStartTime": 1,
+                "flightLegState.flightStatus": 1,
+                "flightLegState.operationalStatus": 1,
+                "flightLegState.operation.actualTimes.offBlock": 1,
+                "_id": 0
+            })
+            
+            routes = []
+            async for doc in cursor:
+                flight_data = doc.get("flightLegState", {})
+                route_info = {
+                    "route_id": f"{flight_data.get('startStation', '')}-{flight_data.get('endStation', '')}",
+                    "carrier": flight_data.get("carrier", "Unknown"),
+                    "flight_number": flight_data.get("flightNumber", "Unknown"),
+                    "startStation": flight_data.get("startStation", "Unknown"),
+                    "endStation": flight_data.get("endStation", "Unknown"),
+                    "scheduledStartTime": flight_data.get("scheduledStartTime", "Unknown"),
+                    "flightStatus": flight_data.get("flightStatus", "Unknown"),
+                    "operationalStatus": flight_data.get("operationalStatus", "Unknown"),
+                    "actualDeparture": flight_data.get("operation", {}).get("actualTimes", {}).get("offBlock", "Unknown")
+                }
+                
+                # Format times for better display
+                if route_info["scheduledStartTime"] != "Unknown":
+                    route_info["scheduledStartTimeFormatted"] = format_time_for_display(route_info["scheduledStartTime"])
+                
+                if route_info["actualDeparture"] != "Unknown":
+                    route_info["actualDepartureFormatted"] = format_time_for_display(route_info["actualDeparture"])
+                
+                routes.append(route_info)
+            
+            # Remove duplicate routes based on route_id
+            unique_routes = []
+            seen_routes = set()
+            for route in routes:
+                if route["route_id"] not in seen_routes:
+                    unique_routes.append(route)
+                    seen_routes.add(route["route_id"])
+            
+            return response_ok({
+                "status": "route_selection_required",
+                "multiple_routes": True,
+                "message": f"Found {len(unique_routes)} different routes for flight {carrier}{flight_number} on {date_of_origin}.",
+                "available_routes": unique_routes,
+                "instruction": "Please select a route by providing the route number (1, 2, 3, etc.)",
+                "selection_type": "dropdown",
+                "next_step": "Call this tool again with the selected_route parameter"
+            })
+        
+        # Step 4: If single document or route selected, proceed with actual delay summary
+        final_query = base_query.copy()
+        if selected_route:
+            try:
+                start_station, end_station = selected_route.split('-')
+                final_query["flightLegState.startStation"] = start_station
+                final_query["flightLegState.endStation"] = end_station
+                logger.info(f"Query modified with selected route: {start_station} -> {end_station}")
+            except ValueError:
+                return response_error("Invalid selected_route format. Expected 'START_STATION-END_STATION'", 400)
+        
+        # Step 5: Fetch the actual delay summary
+        projection = {
+            "flightLegState.carrier": 1,
+            "flightLegState.flightNumber": 1,
+            "flightLegState.dateOfOrigin": 1,
+            "flightLegState.startStation": 1,
+            "flightLegState.endStation": 1,
+            "flightLegState.scheduledStartTime": 1,
+            "flightLegState.operation.actualTimes.offBlock": 1,
+            "flightLegState.delays": 1,
+            "flightLegState.flightStatus": 1,
+            "flightLegState.operationalStatus": 1,
+            "flightLegState.startTimeOffset": 1,
+            "flightLegState.endTimeOffset": 1
+        }
+        
+        # Use the actual fetch function and get the raw result
+        raw_result = await _fetch_one_async(final_query, projection)
+        
+        # Step 6: Format the response in a professional, user-friendly way
+        if isinstance(raw_result, str):
+            try:
+                result_dict = json.loads(raw_result)
+                if result_dict.get("ok") and result_dict.get("data"):
+                    data = result_dict["data"]
+                    flight_data = data.get("flightLegState", {})
+                    
+                    # Format the delay summary professionally
+                    formatted_summary = format_delay_summary_professional(flight_data, selected_route)
+                    
+                    # Return ONLY the formatted summary, not nested structure
+                    return response_ok({
+                        "formatted_summary": formatted_summary,
+                        "selected_route": selected_route if selected_route else "auto_selected",
+                        "flight_info": {
+                            "carrier": flight_data.get("carrier"),
+                            "flight_number": flight_data.get("flightNumber"),
+                            "date": flight_data.get("dateOfOrigin"),
+                            "route": f"{flight_data.get('startStation')} → {flight_data.get('endStation')}"
+                        }
+                    })
+                else:
+                    # If there's an error in the original result, return it
+                    return raw_result
+            except Exception as e:
+                logger.error(f"Error formatting delay summary: {e}")
+                # If formatting fails, return original result
+                return raw_result
+        
+        return raw_result
+        
+    except Exception as e:
+        logger.exception("Error in get_delay_summary")
+        return response_error(f"Database error: {str(e)}", 500)
+
+@mcp.tool()
+async def get_fuel_summary(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Retrieve fuel summary including planned vs actual fuel for takeoff, landing, and total consumption.
+    
+    Args:
+        carrier: Airline carrier code
+        flight_number: Flight number as string
+        date_of_origin: Date in YYYY-MM-DD format
+    """
+    logger.info(f"get_fuel_summary: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    query = make_query(carrier, fn, dob)
+    
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.startStation": 1,
+        "flightLegState.endStation": 1,
+        "flightLegState.operation.fuel": 1,
+        "flightLegState.operation.flightPlan.offBlockFuel": 1,
+        "flightLegState.operation.flightPlan.takeoffFuel": 1,
+        "flightLegState.operation.flightPlan.landingFuel": 1,
+        "flightLegState.operation.flightPlan.holdFuel": 1
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_passenger_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Get passenger count and connection information for the flight.
+    
+    Args:
+        carrier: Airline carrier code
+        flight_number: Flight number as string
+        date_of_origin: Date in YYYY-MM-DD format
+    """
+    logger.info(f"get_passenger_info: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    query = make_query(carrier, fn, dob)
+    
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.pax": 1
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def get_crew_info(carrier: str = "", flight_number: str = "", date_of_origin: str = "") -> str:
+    """
+    Get crew connections and details for the flight.
+    
+    Args:
+        carrier: Airline carrier code
+        flight_number: Flight number as string
+        date_of_origin: Date in YYYY-MM-DD format
+    """
+    logger.info(f"get_crew_info: carrier={carrier}, flight_number={flight_number}, date={date_of_origin}")
+    
+    fn = normalize_flight_number(flight_number) if flight_number else None
+    dob = validate_date(date_of_origin) if date_of_origin else None
+    
+    query = make_query(carrier, fn, dob)
+    
+    projection = {
+        "flightLegState.carrier": 1,
+        "flightLegState.flightNumber": 1,
+        "flightLegState.dateOfOrigin": 1,
+        "flightLegState.crewConnections": 1
+    }
+    
+    return await _fetch_one_async(query, projection)
+
+@mcp.tool()
+async def raw_mongodb_query(query_json: str, projection: str = "", limit: int = 10) -> str:
+    """
+    Execute a raw MongoDB query (stringified JSON) with optional projection.
+
+    Supports intelligent LLM-decided projections to reduce payload size based on query intent.
+
+    Args:
+        query_json: The MongoDB query (as stringified JSON).
+        projection: Optional projection (as stringified JSON) for selecting fields.
+        limit: Max number of documents to return (default 10, capped at 50).
+    """
+
+    def _safe_json_loads(text: str) -> dict:
+        """Safely parse JSON, handling single quotes and formatting errors."""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            try:
+                fixed = text.replace("'", '"')
+                return json.loads(fixed)
+            except Exception as e:
+                raise ValueError(f"Invalid JSON: {e}")
+
+    try:
+        _, _, col = await get_mongodb_client()
+
+        # --- Parse Query ---
+        try:
+            query = _safe_json_loads(query_json)
+        except ValueError as e:
+            return response_error(f"❌ Invalid query_json: {str(e)}", 400)
+
+        # --- Parse Projection (optional) ---
+        projection_dict = None
+        if projection:
+            try:
+                projection_dict = _safe_json_loads(projection)
+            except ValueError as e:
+                return response_error(f"❌ Invalid projection JSON: {str(e)}", 400)
+
+        # --- Validate types ---
+        if not isinstance(query, dict):
+            return response_error("❌ query_json must be a JSON object.", 400)
+        if projection_dict and not isinstance(projection_dict, dict):
+            return response_error("❌ projection must be a JSON object.", 400)
+
+        # --- Safety guard ---
+        forbidden_ops = ["$where", "$out", "$merge", "$accumulator", "$function"]
+        for key in query.keys():
+            if key in forbidden_ops or key.startswith("$"):
+                return response_error(f"❌ Operator '{key}' is not allowed.", 400)
+
+        limit = min(max(1, int(limit)), 50)
+
+        # --- Fallback projection ---
+        # If the LLM forgets to include projection, return a minimal safe set.
+        if not projection_dict:
+            projection_dict = {
+                "_id": 0,
+                "flightLegState.carrier": 1,
+                "flightLegState.flightNumber": 1,
+                "flightLegState.dateOfOrigin": 1
+            }
+            
+        logger.info(f"Executing MongoDB query: {query} | projection={projection_dict} | limit={limit}")
+
+        # --- Run query ---
+        cursor = col.find(query, projection_dict).sort("flightLegState.dateOfOrigin", -1).limit(limit)
+        docs = []
+        async for doc in cursor:
+            doc.pop("_id", None)
+            doc.pop("_class", None)
+            docs.append(doc)
+
+        if not docs:
+            return response_error("No documents found for the given query.", 404)
+
+        return response_ok({
+            "count": len(docs),
+            "query": query,
+            "projection": projection_dict,
+            "documents": docs
+        })
+
+    except Exception as exc:
+        logger.exception("❌ raw_mongodb_query failed")
+        return response_error(f"Raw MongoDB query failed: {str(exc)}", 500)
+
+@mcp.tool()
+async def run_aggregated_query(
+    query_type: str = "",
+    carrier: str = "",
+    field: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    filter_json: str = ""
+) -> str:
+    """
+    Run statistical or comparative MongoDB aggregation queries.
+
+    Args:
+        query_type: "average", "sum", "min", "max", "count".
+        carrier: Optional carrier filter.
+        field: Field to aggregate, e.g. "flightLegState.pax.passengerCount.count".
+        start_date: Optional start date (YYYY-MM-DD).
+        end_date: Optional end date (YYYY-MM-DD).
+        filter_json: Optional filter query (as JSON string).
+    """
+
+    _, _, col = await get_mongodb_client()
+
+    match_stage = {}
+
+    # --- Optional filters ---
+    if filter_json:
+        try:
+            match_stage.update(json.loads(filter_json.replace("'", '"')))
+        except Exception as e:
+            return response_error(f"Invalid filter_json: {e}", 400)
+
+    if carrier:
+        match_stage["flightLegState.carrier"] = carrier
+    if start_date and end_date:
+        match_stage["flightLegState.dateOfOrigin"] = {"$gte": start_date, "$lte": end_date}
+
+    agg_map = {
+        "average": {"$avg": f"${field}"},
+        "sum": {"$sum": f"${field}"},
+        "min": {"$min": f"${field}"},
+        "max": {"$max": f"${field}"},
+        "count": {"$sum": 1},
+    }
+
+    if query_type not in agg_map:
+        return response_error(f"Unsupported query_type '{query_type}'. Use one of: average, sum, min, max, count", 400)
+
+    pipeline = [{"$match": match_stage}, {"$group": {"_id": None, "value": agg_map[query_type]}}]
+
+    try:
+        logger.info(f"Running aggregation pipeline: {pipeline}")
+        docs = await col.aggregate(pipeline).to_list(length=10)
+        return response_ok({"pipeline": pipeline, "results": docs})
+    except Exception as e:
+        logger.exception("Aggregation query failed")
+        return response_error(f"Aggregation failed: {str(e)}", 500)
+
+# --- Performance Monitoring Decorator ---
+import time
+from functools import wraps
+
+def track_performance(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        try:
+            result = await func(*args, **kwargs)
+            execution_time = time.time() - start_time
+            logger.info(f"{func.__name__} executed in {execution_time:.2f}s")
+            
+            # Log slow queries
+            if execution_time > 2.0:  # 2 seconds threshold
+                logger.warning(f"Slow query detected: {func.__name__} took {execution_time:.2f}s")
+                
+            return result
+        except Exception as e:
+            execution_time = time.time() - start_time
+            logger.error(f"{func.__name__} failed after {execution_time:.2f}s: {str(e)}")
+            raise
+    return wrapper
+
+# Apply performance tracking to all tools
+for tool_name, tool_func in list(mcp._tools.items()):
+    mcp._tools[tool_name] = track_performance(tool_func)
+
+# --- Run MCP Server ---
+if __name__ == "__main__":
+    logger.info("Starting FlightOps MCP Server on %s:%s (transport=%s)", HOST, PORT, TRANSPORT)
+    logger.info("MongoDB URL: %s, Database: %s, Collection: %s", MONGODB_URL, DATABASE_NAME, COLLECTION_NAME)
+    mcp.run(transport="streamable-http")
+  ##########################################
+  # client.py
+import os
+import json
+import logging
+import asyncio
+from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from openai import AzureOpenAI
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+from tool_registry import TOOLS
+
+# Load environment variables
+load_dotenv()
+
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8000").rstrip("/")
+
+# Azure OpenAI configuration
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+
+if not AZURE_OPENAI_KEY:
+    raise RuntimeError("❌ AZURE_OPENAI_KEY not set in environment")
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("FlightOps.MCPClient")
+
+# Initialize Azure OpenAI client
+client_azure = AzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
+
+# ---------------------------------------------------------------------
+#  SYSTEM PROMPTS
+# ---------------------------------------------------------------------
+def _build_tool_prompt() -> str:
+    """Convert TOOLS dict into compact text to feed the LLM."""
+    lines = []
+    for name, meta in TOOLS.items():
+        arg_str = ", ".join(meta["args"])
+        lines.append(f"- {name}({arg_str}): {meta['desc']}")
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT_PLAN = f"""
+You are an assistant that converts user questions into MCP tool calls.
+
+Available tools:
+{_build_tool_prompt()}
+
+### Tool selection logic
+
+1. **Use `run_aggregated_query`** when the user asks for:
+   - counts, numbers, totals, sums, averages, minimums, or maximums
+   - examples: "how many flights", "number of passengers", "average delay", "max flight time", "total fuel"
+   - In such cases:
+     - set `"query_type"` to one of ["count", "sum", "average", "min", "max"]
+     - set `"field"` to the appropriate MongoDB path (e.g. "flightLegState.pax.passengerCount.count")
+     - if the user gives a condition (e.g. "where delay > 30"), include it as `"filter_json"`
+     - optionally include `"start_date"` and `"end_date"` for time ranges
+
+     Example:
+     {{
+       "plan": [
+         {{
+           "tool": "run_aggregated_query",
+           "arguments": {{
+             "query_type": "count",
+             "field": "flightLegState.pax.passengerCount.count",
+             "filter_json": "{{ 'flightLegState.pax.passengerCount.count': {{ '$gt': 100 }} }}"
+           }}
+         }}
+       ]
+     }}
+
+2. **Use `raw_mongodb_query`** for:
+   - retrieving lists of flights, filtered data, or detailed fields
+   - when the question asks to "show", "list", "find", or "get" specific flight data
+   - supports `"projection"` to reduce payload (LLM decides what to include)
+
+     Example:
+     {{
+       "plan": [
+         {{
+           "tool": "raw_mongodb_query",
+           "arguments": {{
+             "query_json": "{{ 'flightLegState.startStation': 'DEL', 'flightLegState.endStation': 'BOM' }}",
+             "projection": "{{ 'flightLegState.flightNumber': 1, 'flightLegState.startStation': 1, 'flightLegState.endStation': 1, '_id': 0 }}",
+             "limit": 10
+           }}
+         }}
+       ]
+     }}
+
+3. **Use existing tools** (like get_flight_basic_info, get_delay_summary, etc.) for single-flight queries (where a flight number and date are specified).
+
+---
+
+### Schema summary (for projection guidance)
+
+Flight documents contain(Schema):
+    'carrier': 'flightLegState.carrier',
+    'date_of_origin': 'flightLegState.dateOfOrigin',
+    'flight_number': 'flightLegState.flightNumber',
+    'suffix': 'flightLegState.suffix',
+    'sequence_number': 'flightLegState.seqNumber',
+    'origin': 'flightLegState.startStation',
+    'destination': 'flightLegState.endStation',
+    'scheduled_departure': 'flightLegState.scheduledStartTime',
+    'scheduled_arrival': 'flightLegState.scheduledEndTime',
+    'end_terminal': 'flightLegState.endTerminal',
+    'operational_status': 'flightLegState.operationalStatus',
+    'flight_status': 'flightLegState.flightStatus',
+    'start_country': 'flightLegState.startCountry',
+    'end_country': 'flightLegState.endCountry',
+    'aircraft_registration': 'flightLegState.equipment.aircraftRegistration',
+    'aircraft_type': 'flightLegState.equipment.assignedAircraftTypeIATA',
+    'start_gate': 'flightLegState.startGate',
+    'end_gate': 'flightLegState.endGate',
+    'start_terminal': 'flightLegState.startTerminal',
+    'delay_total': 'flightLegState.delays.total',
+    'flight_type': 'flightLegState.flightType',
+    'operations': 'flightLegState.operation',
+    'estimated_times': 'flightLegState.operation.estimatedTimes',
+    'off_block_time': 'flightLegState.operation.estimatedTimes.offBlock',
+    'in_block_time': 'flightLegState.operation.estimatedTimes.inBlock',
+    'takeoff_time': 'flightLegState.operation.estimatedTimes.takeoffTime',
+    'landing_time': 'flightLegState.operation.estimatedTimes.landingTime',
+    'actual_times': 'flightLegState.operation.actualTimes',
+    'actual_off_block_time': 'flightLegState.operation.actualTimes.offBlock',
+    'actual_in_block_time': 'flightLegState.operation.actualTimes.inBlock',
+    'actual_takeoff_time': 'flightLegState.operation.actualTimes.takeoffTime',
+    'actual_landing_time': 'flightLegState.operation.actualTimes.landingTime',
+    'door_close_time': 'flightLegState.operation.estimatedTimes.doorClose',
+    'fuel':'flightLegState.operation.fuel',
+    'fuel_off_block':'flightLegState.operation.fuel.offBlock',
+    'fuel_takeoff':'flightLegState.operation.fuel.takeoff',
+    'fuel_landing':'flightLegState.operation.fuel.landing',
+    'fuel_in_block':'flightLegState.operation.fuel.inBlock',
+    'autoland':'flightLegState.operation.autoland',
+    'flight_plan':'flightLegState.operation.flightPlan',
+    'estimated_Elapsed_time':'flightLegState.operation.flightPlan.estimatedElapsedTime',
+    'actual_Takeoff_time':'flightLegState.operation.flightPlan.acTakeoffWeight',
+    'flight_plan_takeoff_fuel':'flightLegState.operation.flightPlan.takeoffFuel',
+    'flight_plan_landing_fuel':'flightLegState.operation.flightPlan.landingFuel',
+    'flight_plan_hold_fuel':'flightLegState.operation.flightPlan.holdFuel',
+    'flight_plan_hold_time':'flightLegState.operation.flightPlan.holdTime',
+    'flight_plan_route_distance':'flightLegState.operation.flightPlan.routeDistance',
+
+---
+
+### Projection rules for `raw_mongodb_query`
+- Only include fields relevant to the question.
+- Always exclude "_id".
+- Examples:
+  - "passenger" → include flightNumber, pax.passengerCount
+  - "delay" or "reason" → include flightNumber, delays.total, delays.delay.reason
+  - "aircraft" or "tail" → include equipment.aircraftRegistration, aircraft.type
+  - "station" or "sector" → include startStation, endStation, terminals
+  - "crew" → include crewConnections.crew.givenName, position
+  - "timing / departure / arrival / dep / arr" → include scheduledStartTime, scheduledEndTime, operation.actualTimes
+  - "fuel" → include operation.fuel
+  - "OTP" or "on-time" → include isOTPAchieved, flightStatus
+
+---
+
+### General rules
+1. Always return valid JSON with a top-level "plan" key.
+2. Use the correct tool type based on query intent.
+3. Never invent field names — use schema fields only.
+4. Never return "_id" in projections.
+5. For numerical summaries → use run_aggregated_query.
+6. For filtered listings → use raw_mongodb_query.
+"""
+
+
+SYSTEM_PROMPT_SUMMARIZE = """
+You are an assistant that summarizes tool outputs into a concise, readable answer.
+Be factual, short, and helpful.
+"""
+
+# ---------------------------------------------------------------------
+#  FLIGHTOPS MCP CLIENT CLASS
+# ---------------------------------------------------------------------
+class FlightOpsMCPClient:
+    def __init__(self, base_url: str = None):
+        self.base_url = (base_url or MCP_SERVER_URL).rstrip("/")
+        self.session: ClientSession = None
+        self._client_context = None
+
+    # -------------------- CONNECTION HANDLERS -------------------------
+    async def connect(self):
+        try:
+            logger.info(f"Connecting to MCP server at {self.base_url}")
+            self._client_context = streamablehttp_client(self.base_url)
+            read_stream, write_stream, _ = await self._client_context.__aenter__()
+            self.session = ClientSession(read_stream, write_stream)
+            await self.session.__aenter__()
+            await self.session.initialize()
+            logger.info("✅ Connected to MCP server successfully")
+        except Exception as e:
+            logger.error(f"Failed to connect to MCP server: {e}")
+            raise
+
+    async def disconnect(self):
+        try:
+            if self.session:
+                await self.session.__aexit__(None, None, None)
+            if self._client_context:
+                await self._client_context.__aexit__(None, None, None)
+            logger.info("Disconnected from MCP server")
+        except Exception as e:
+            logger.error(f"Error during disconnect: {e}")
+
+    # -------------------- AZURE OPENAI WRAPPER -------------------------
+    def _call_azure_openai(self, messages: list, temperature: float = 0.2, max_tokens: int = 2048) -> dict:
+        try:
+            completion = client_azure.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            usage_obj = getattr(completion, "usage", None)
+            usage = None
+            if usage_obj is not None:
+                usage = {
+                    "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0) or 0,
+                    "completion_tokens": getattr(usage_obj, "completion_tokens", 0) or 0,
+                    "total_tokens": getattr(usage_obj, "total_tokens", 0) or 0,
+                }
+            return {
+                "content": completion.choices[0].message.content,
+                "usage": usage
+            }
+        except Exception as e:
+            logger.error(f"Azure OpenAI API error: {e}")
+            return {"content": json.dumps({"error": str(e)}), "usage": None}
+
+    # -------------------- MCP TOOL CALLS -------------------------
+    async def list_tools(self) -> dict:
+        try:
+            if not self.session:
+                await self.connect()
+            tools_list = await self.session.list_tools()
+            tools_dict = {tool.name: {"description": tool.description, "inputSchema": tool.inputSchema} for tool in tools_list.tools}
+            return {"tools": tools_dict}
+        except Exception as e:
+            logger.error(f"Error listing tools: {e}")
+            return {"error": str(e)}
+
+    async def invoke_tool(self, tool_name: str, args: dict) -> dict:
+        try:
+            if not self.session:
+                await self.connect()
+            logger.info(f"Calling tool: {tool_name} with args: {args}")
+            result = await self.session.call_tool(tool_name, args)
+
+            if result.content:
+                content_items = []
+                for item in result.content:
+                    if hasattr(item, 'text'):
+                        try:
+                            content_items.append(json.loads(item.text))
+                        except json.JSONDecodeError:
+                            content_items.append(item.text)
+                if len(content_items) == 1:
+                    return content_items[0]
+                return {"results": content_items}
+
+            return {"error": "No content in response"}
+        except Exception as e:
+            logger.error(f"Error invoking tool {tool_name}: {e}")
+            return {"error": str(e)}
+
+    # -------------------- LLM PLANNING & SUMMARIZATION -------------------------
+    def plan_tools(self, user_query: str) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_PLAN},
+            {"role": "user", "content": user_query},
+        ]
+
+        res = self._call_azure_openai(messages, temperature=0.1)
+        content = res.get("content")
+        plan_usage = res.get("usage")
+        
+        if not content:
+            logger.warning("⚠️ LLM returned empty response during plan generation.")
+            return {"plan": [], "llm_usage": plan_usage}
+
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+            cleaned = cleaned.replace("```", "").strip()
+
+        if cleaned != content:
+            logger.debug(f"🔍 Cleaned LLM plan output:\n{cleaned}")
+
+        try:
+            plan = json.loads(cleaned)
+            if isinstance(plan, dict) and "plan" in plan:
+                return {"plan": plan["plan"], "llm_usage": plan_usage}
+            else:
+                logger.warning("⚠️ LLM output did not contain 'plan' key.")
+                return {"plan": [], "llm_usage": plan_usage}
+        except json.JSONDecodeError:
+            logger.warning(f"❌ Could not parse LLM plan output after cleaning:\n{cleaned}")
+            return {"plan": [], "llm_usage": plan_usage}
+
+    def summarize_results(self, user_query: str, plan: list, results: list) -> dict:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_SUMMARIZE},
+            {"role": "user", "content": f"Question:\n{user_query}"},
+            {"role": "assistant", "content": f"Plan:\n{json.dumps(plan, indent=2)}"},
+            {"role": "assistant", "content": f"Results:\n{json.dumps(results, indent=2)}"},
+        ]
+        res = self._call_azure_openai(messages, temperature=0.3)
+        return {"summary": res.get("content"), "llm_usage": res.get("usage")}
+
+    async def run_query(self, user_query: str) -> dict:
+        """
+        Full flow with proper token tracking for cost monitoring
+        """
+        try:
+            logger.info(f"User query: {user_query}")
+            
+            # Track all token usage
+            total_token_usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0, 
+                "total_tokens": 0
+            }
+            
+            def update_token_usage(usage_dict):
+                if usage_dict:
+                    total_token_usage["prompt_tokens"] += usage_dict.get("prompt_tokens", 0)
+                    total_token_usage["completion_tokens"] += usage_dict.get("completion_tokens", 0)
+                    total_token_usage["total_tokens"] += usage_dict.get("total_tokens", 0)
+            
+            # Step 1: Planning
+            plan_data = self.plan_tools(user_query)
+            plan = plan_data.get("plan", [])
+            planning_usage = plan_data.get("llm_usage")
+            update_token_usage(planning_usage)
+            
+            if not plan:
+                return {
+                    "error": "LLM did not produce a valid tool plan.",
+                    "token_usage": total_token_usage
+                }
+
+            # Step 2: Execute plan
+            results = []
+            for step in plan:
+                tool = step.get("tool")
+                args = step.get("arguments", {})
+                
+                # Clean up bad args
+                args = {k: v for k, v in args.items() if v and str(v).strip().lower() != "unknown"}
+
+                if tool == "raw_mongodb_query":
+                    query_json = args.get("query_json", "")
+                    if not query_json:
+                        results.append({"raw_mongodb_query": {"error": "Empty query_json"}})
+                        continue
+                    args["limit"] = int(args.get("limit", 50))
+                    logger.info(f"Executing raw MongoDB query: {query_json}")
+
+                resp = await self.invoke_tool(tool, args)
+                results.append({tool: resp})
+                
+                # Check if this is a route selection response
+                if (tool == "get_delay_summary" and 
+                    isinstance(resp, dict) and 
+                    resp.get("ok") and 
+                    resp.get("data", {}).get("status") == "route_selection_required"):
+                    
+                    # Return early with route selection data
+                    return {
+                        "status": "route_selection_required",
+                        "route_data": resp["data"],
+                        "plan": plan,
+                        "results": results,
+                        "token_usage": total_token_usage
+                    }
+
+            # Step 3: Summarization (only if we have actual results)
+            summary_data = self.summarize_results(user_query, plan, results)
+            summarization_usage = summary_data.get("llm_usage")
+            update_token_usage(summarization_usage)
+            
+            return {
+                "status": "completed",
+                "plan": plan,
+                "results": results,
+                "summary": summary_data.get("summary"),
+                "token_usage": total_token_usage
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in run_query: {e}")
+            return {"error": str(e), "token_usage": total_token_usage}
+###########################################
+  # ag_ui_adapter.py
+import os
+import json
+import asyncio
+import time
+import uuid
+import re
+from typing import AsyncGenerator, List
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from client import FlightOpsMCPClient
+
+app = FastAPI(title="FlightOps — AG-UI Adapter")
+
+# CORS (adjust origins for your Vite origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mcp_client = FlightOpsMCPClient()
+
+# Global context storage for route selection
+route_selection_context = {}
+last_thread_with_routes = None  # Track last thread that had routes
+
+def sse_event(data: dict) -> str:
+    """Encode one SSE event (JSON payload)"""
+    return f"data: {json.dumps(data, default=str, ensure_ascii=False)}\n\n"
+
+async def ensure_mcp_connected():
+    if not mcp_client.session:
+        await mcp_client.connect()
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        await ensure_mcp_connected()
+    except Exception:
+        pass
+
+@app.get("/")
+async def root():
+    return {"message": "FlightOps AG-UI Adapter running", "status": "ok"}
+
+@app.get("/health")
+async def health():
+    try:
+        await ensure_mcp_connected()
+        return {"status": "healthy", "mcp_connected": True}
+    except Exception as e:
+        return {"status": "unhealthy", "mcp_connected": False, "error": str(e)}
+
+def chunk_text(txt: str, max_len: int = 200) -> List[str]:
+    txt = txt or ""
+    parts: List[str] = []
+    buf = ""
+
+    def flush():
+        nonlocal buf
+        if buf:
+            parts.append(buf)
+            buf = ""
+
+    for ch in txt:
+        buf += ch
+        if ch in ".!?\n" and len(buf) >= max_len // 2:
+            flush()
+        elif len(buf) >= max_len:
+            flush()
+    flush()
+    return parts
+
+@app.post("/agent", response_class=StreamingResponse)
+async def run_agent(request: Request):
+    global last_thread_with_routes
+    
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    thread_id = body.get("thread_id") or f"thread-{uuid.uuid4().hex[:8]}"
+    run_id = body.get("run_id") or f"run-{uuid.uuid4().hex[:8]}"
+    messages = body.get("messages", [])
+    
+    # Route selection handling with improved logic
+    is_route_selection = False
+    user_selected_route = None
+    original_tool_args = None
+    context_thread_id = thread_id
+    
+    # Improved fallback logic
+    if thread_id not in route_selection_context and last_thread_with_routes in route_selection_context:
+        context_thread_id = last_thread_with_routes
+        logger.info(f"Using fallback thread context: {context_thread_id}")
+    
+    if context_thread_id in route_selection_context:
+        if messages:
+            last_message = messages[-1]
+            if isinstance(last_message, dict) and last_message.get("role") == "user":
+                user_input = last_message.get("content", "").strip()
+                is_route_selection = True
+                context = route_selection_context[context_thread_id]
+                available_routes = context.get("available_routes", [])
+                original_tool_args = context.get("original_args", {})
+                
+                # Parse route selection
+                try:
+                    numbers = re.findall(r'\d+', user_input)
+                    if numbers:
+                        route_number = int(numbers[0])
+                        if 1 <= route_number <= len(available_routes):
+                            selected_route = available_routes[route_number - 1]["route_id"]
+                            user_selected_route = selected_route
+                            logger.info(f"User selected route: {user_selected_route}")
+                        else:
+                            user_selected_route = "invalid"
+                    else:
+                        user_selected_route = "invalid"
+                except Exception as e:
+                    logger.error(f"Error parsing route selection: {e}")
+                    user_selected_route = "invalid"
+
+    # Get user query
+    user_query = ""
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            user_query = last.get("content", "") or ""
+        elif isinstance(last, str):
+            user_query = last
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        global last_thread_with_routes
+        
+        # Safe integer conversion function
+        def safe_int(val, default=0):
+            try:
+                return int(val) if val is not None else default
+            except (ValueError, TypeError):
+                return default
+
+        # RUN STARTED
+        yield sse_event({"type": "RUN_STARTED", "thread_id": thread_id, "run_id": run_id})
+        
+        # CASE 1: Route Selection Response
+        if is_route_selection:
+            if user_selected_route == "invalid":
+                # Invalid selection - show routes again
+                context = route_selection_context[context_thread_id]
+                available_routes = context.get("available_routes", [])
+                
+                route_options = []
+                for idx, route in enumerate(available_routes):
+                    route_options.append(
+                        f"**{idx+1}. {route['startStation']} → {route['endStation']}**\n"
+                        f"   - Time: {route.get('scheduledStartTimeFormatted', route.get('scheduledStartTime', 'Unknown'))}\n"
+                        f"   - Status: {route['flightStatus']}\n"
+                        f"   - Operational: {route.get('operationalStatus', 'Unknown')}"
+                    )
+                
+                yield sse_event({
+                    "type": "TEXT_MESSAGE_CONTENT",
+                    "message": {
+                        "id": f"msg-{uuid.uuid4().hex[:8]}",
+                        "role": "assistant",
+                        "content": f"❌ Invalid selection. Please choose a valid route number (1-{len(available_routes)}):\n\n" + 
+                                  "\n\n".join(route_options)
+                    }
+                })
+                yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+                yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+                return
+            
+            # Valid route selected - process query
+            yield sse_event({
+                "type": "STATE_UPDATE", 
+                "state": {
+                    "phase": "processing", 
+                    "progress_pct": 50,
+                    "message": f"🔄 Fetching delay summary for selected route..."
+                }
+            })
+            
+            try:
+                # Call tool with selected route
+                tool_result = await mcp_client.invoke_tool(
+                    "get_delay_summary", 
+                    {**original_tool_args, "selected_route": user_selected_route}
+                )
+                
+                # Clear context
+                if context_thread_id in route_selection_context:
+                    route_selection_context.pop(context_thread_id)
+                last_thread_with_routes = None
+                
+                # Process and display results
+                if isinstance(tool_result, dict) and tool_result.get("ok"):
+                    result_data = tool_result.get('data', {})
+                    
+                    if "formatted_summary" in result_data:
+                        formatted_summary = result_data["formatted_summary"]
+                    else:
+                        # Fallback formatting
+                        delay_data = result_data
+                        formatted_summary = f"Delay summary for {user_selected_route}\n"
+                        if isinstance(delay_data, dict) and 'flightLegState' in delay_data:
+                            flight_info = delay_data['flightLegState']
+                            formatted_summary += f"Flight: {flight_info.get('carrier', '')}{flight_info.get('flightNumber', '')}\n"
+                            formatted_summary += f"Route: {flight_info.get('startStation', '')} → {flight_info.get('endStation', '')}\n"
+                
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant",
+                            "content": formatted_summary
+                        }
+                    })
+                else:
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant", 
+                            "content": f"❌ Error fetching delay summary: {tool_result}"
+                        }
+                    })
+                    
+            except Exception as e:
+                yield sse_event({
+                    "type": "TEXT_MESSAGE_CONTENT", 
+                    "message": {
+                        "id": f"msg-{uuid.uuid4().hex[:8]}",
+                        "role": "assistant",
+                        "content": f"❌ Error processing route selection: {str(e)}"
+                    }
+                })
+            
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # CASE 2: New Query (Normal Flow)
+        if not user_query.strip():
+            yield sse_event({"type": "RUN_ERROR", "error": "No user query found"})
+            return
+
+        # Initial setup
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "thinking", 
+                "progress_pct": 5,
+                "message": "🧠 Analyzing your flight query..."
+            }
+        })
+
+        try:
+            await ensure_mcp_connected()
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"MCP connect failed: {e}"})
+            return
+
+        loop = asyncio.get_event_loop()
+
+        # Planning phase
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "thinking", 
+                "progress_pct": 15,
+                "message": "📋 Planning which flight data tools to use..."
+            }
+        })
+        
+        try:
+            plan_data = await loop.run_in_executor(None, mcp_client.plan_tools, user_query)
+        except Exception as e:
+            yield sse_event({"type": "RUN_ERROR", "error": f"Planner error: {e}"})
+            return
+
+        plan = plan_data.get("plan", []) if isinstance(plan_data, dict) else []
+        planning_usage = plan_data.get("llm_usage", {})
+        
+        # Send planning token usage
+        if planning_usage:
+            yield sse_event({
+                "type": "TOKEN_USAGE",
+                "phase": "planning",
+                "usage": planning_usage
+            })
+        
+        if not plan:
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT", 
+                "message": {
+                    "id": f"msg-{uuid.uuid4().hex[:8]}",
+                    "role": "assistant",
+                    "content": "I couldn't generate a valid plan for your query. Please try rephrasing."
+                }
+            })
+            yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+            yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+            return
+
+        # Tool execution
+        yield sse_event({
+            "type": "STATE_UPDATE", 
+            "state": {
+                "phase": "processing", 
+                "progress_pct": 20,
+                "message": f"🛠️ Executing {len(plan)} flight data tools..."
+            }
+        })
+
+        results = []
+        route_selection_detected = False
+        
+        for step_index, step in enumerate(plan):
+            tool_name = step.get("tool")
+            args = step.get("arguments", {}) or {}
+
+            yield sse_event({
+                "type": "STATE_UPDATE", 
+                "state": {
+                    "phase": "processing",
+                    "progress_pct": 20 + (step_index / len(plan)) * 60,
+                    "message": f"🔧 Running {tool_name}..."
+                }
+            })
+
+            try:
+                tool_result = await mcp_client.invoke_tool(tool_name, args)
+                
+                # Check for route selection requirement
+                if (tool_name == "get_delay_summary" and 
+                    isinstance(tool_result, dict) and 
+                    tool_result.get("ok") and 
+                    tool_result.get("data", {}).get("status") == "route_selection_required"):
+                    
+                    route_data = tool_result["data"]
+                    route_selection_context[thread_id] = {
+                        "available_routes": route_data["available_routes"],
+                        "original_args": args,
+                        "planning_usage": planning_usage
+                    }
+                    last_thread_with_routes = thread_id
+                    route_selection_detected = True
+                    
+                    # Format route options for dropdown
+                    route_options = []
+                    for idx, route in enumerate(route_data["available_routes"]):
+                        route_options.append(
+                            f"**{idx+1}. {route['startStation']} → {route['endStation']}**\n"
+                            f"   - Time: {route.get('scheduledStartTimeFormatted', route.get('scheduledStartTime', 'Unknown'))}\n"
+                            f"   - Status: {route['flightStatus']}\n"
+                            f"   - Operational: {route.get('operationalStatus', 'Unknown')}"
+                        )
+                    
+                    route_message = "\n\n".join(route_options)
+                    
+                    yield sse_event({
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "message": {
+                            "id": f"msg-{uuid.uuid4().hex[:8]}",
+                            "role": "assistant",
+                            "content": f"**🛫 Multiple Routes Found!**\n\n"
+                                      f"{route_message}\n\n"
+                                      f"**Please select a route by entering the number (1-{len(route_data['available_routes'])}):**"
+                        }
+                    })
+                    
+                    # Send total token usage (only planning so far)
+                    if planning_usage:
+                        yield sse_event({
+                            "type": "TOKEN_USAGE",
+                            "phase": "total",
+                            "usage": planning_usage
+                        })
+                    
+                    yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+                    yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+                    return
+                    
+            except Exception as exc:
+                tool_result = {"error": str(exc)}
+
+            results.append({tool_name: tool_result})
+
+        # If we reached here, no route selection was needed - proceed with summarization
+        if not route_selection_detected:
+            yield sse_event({
+                "type": "STATE_UPDATE", 
+                "state": {
+                    "phase": "typing", 
+                    "progress_pct": 85,
+                    "message": "✍️ Generating your flight analysis..."
+                }
+            })
+
+            try:
+                summary_data = await loop.run_in_executor(None, mcp_client.summarize_results, user_query, plan, results)
+                assistant_text = summary_data.get("summary", "") if isinstance(summary_data, dict) else str(summary_data)
+                summarization_usage = summary_data.get("llm_usage", {})
+                
+                # Send summarization token usage
+                if summarization_usage:
+                    yield sse_event({
+                        "type": "TOKEN_USAGE",
+                        "phase": "summarization", 
+                        "usage": summarization_usage
+                    })
+                    
+                    # Calculate and send total token usage
+                    total_usage = {
+                        "prompt_tokens": safe_int(planning_usage.get('prompt_tokens', 0)) + safe_int(summarization_usage.get('prompt_tokens', 0)),
+                        "completion_tokens": safe_int(planning_usage.get('completion_tokens', 0)) + safe_int(summarization_usage.get('completion_tokens', 0)),
+                        "total_tokens": safe_int(planning_usage.get('total_tokens', 0)) + safe_int(summarization_usage.get('total_tokens', 0))
+                    }
+                    
+                    yield sse_event({
+                        "type": "TOKEN_USAGE",
+                        "phase": "total",
+                        "usage": total_usage
+                    })
+                elif planning_usage:
+                    # If no summarization usage, send planning as total
+                    yield sse_event({
+                        "type": "TOKEN_USAGE",
+                        "phase": "total",
+                        "usage": planning_usage
+                    })
+                    
+            except Exception as e:
+                assistant_text = f"❌ Failed to summarize results: {e}"
+                if planning_usage:
+                    yield sse_event({
+                        "type": "TOKEN_USAGE",
+                        "phase": "total",
+                        "usage": planning_usage
+                    })
+
+            # Stream the final response
+            msg_id = f"msg-{uuid.uuid4().hex[:8]}"
+            yield sse_event({
+                "type": "TEXT_MESSAGE_CONTENT",
+                "message": {
+                    "id": msg_id,
+                    "role": "assistant",
+                    "content": assistant_text
+                }
+            })
+
+        yield sse_event({"type": "STATE_UPDATE", "state": {"phase": "finished", "progress_pct": 100}})
+        yield sse_event({"type": "RUN_FINISHED", "run_id": run_id})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+# Add logging configuration
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("FlightOps.UIAdapter")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+##################################
+import React, { useState, useRef, useEffect } from "react";
+import MessageBubble from "./MessageBubble";
+
+const AG_AGENT_ENDPOINT = import.meta.env.VITE_AGENT_ENDPOINT || "http://localhost:8001/agent";
+
+export default function ChatPage() {
+    const [messages, setMessages] = useState([
+        {
+            role: "assistant",
+            content: "Hello! 👋 I'm your FlightOps Agent. Ask me anything about flight operations — delays, fuel, passengers, aircraft details, etc.",
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        },
+    ]);
+    const [input, setInput] = useState("");
+    const [loading, setLoading] = useState(false);
+    const [agentState, setAgentState] = useState({
+        phase: 'idle',
+        progress: 0,
+        message: ''
+    });
+    const [tokenUsage, setTokenUsage] = useState({
+        planning: null,
+        summarization: null,
+        total: null
+    });
+    const [showRouteHint, setShowRouteHint] = useState(false);
+    const [availableRoutes, setAvailableRoutes] = useState([]);
+    const [currentRouteMessageId, setCurrentRouteMessageId] = useState(null);
+    const messagesEndRef = useRef(null);
+
+    const scrollToBottom = () => {
+        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    };
+
+    useEffect(() => {
+        scrollToBottom();
+    }, [messages]);
+
+    // Auto-focus input when route selection is needed
+    useEffect(() => {
+        const lastMessage = messages[messages.length - 1];
+        if (lastMessage && lastMessage.role === "assistant" && 
+            lastMessage.content.includes("Multiple Routes Found!")) {
+            setShowRouteHint(true);
+            // Auto-focus input for better UX
+            const inputElement = document.querySelector(".message-input");
+            if (inputElement) inputElement.focus();
+        } else {
+            setShowRouteHint(false);
+        }
+    }, [messages]);
+
+    async function sendMessage() {
+        if (!input.trim()) return;
+
+        const userMessage = { 
+            role: "user", 
+            content: input,
+            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        };
+        setMessages((prev) => [...prev, userMessage]);
+        setLoading(true);
+        setInput("");
+        
+        setAgentState({
+            phase: 'thinking',
+            progress: 0,
+            message: 'Starting analysis...'
+        });
+        setTokenUsage({
+            planning: null,
+            summarization: null,
+            total: null
+        });
+
+        const body = {
+            thread_id: "thread-" + Date.now(),
+            run_id: "run-" + Date.now(),
+            messages: [...messages, userMessage],
+        };
+
+        try {
+            const resp = await fetch(AG_AGENT_ENDPOINT, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+
+            if (!resp.ok) {
+                const errTxt = await resp.text();
+                throw new Error(errTxt);
+            }
+
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = "";
+            let currentMessageId = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+
+                let idx;
+                while ((idx = buf.indexOf("\n\n")) !== -1) {
+                    const chunk = buf.slice(0, idx).trim();
+                    buf = buf.slice(idx + 2);
+                    const lines = chunk.split("\n");
+
+                    for (const line of lines) {
+                        if (line.startsWith("data: ")) {
+                            const payload = line.slice(6).trim();
+                            if (!payload) continue;
+
+                            try {
+                                const event = JSON.parse(payload);
+                                console.log("SSE Event:", event.type, event);
+                                handleEvent(event, currentMessageId);
+                            } catch (err) {
+                                console.warn("Bad SSE line:", payload, err);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("Error in sendMessage:", err);
+            setMessages((prev) => [
+                ...prev,
+                { 
+                    role: "assistant", 
+                    content: "⚠️ Error: " + err.message,
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                },
+            ]);
+            setAgentState({ phase: 'idle', progress: 0, message: '' });
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    function handleEvent(event, currentMessageId) {
+        const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        
+        console.log("Processing event:", event.type);
+        
+        switch (event.type) {
+            case "STATE_UPDATE":
+                setAgentState(event.state);
+                break;
+                
+            case "TEXT_MESSAGE_CONTENT":
+                if (event.message) {
+                    if (event.message.delta) {
+                        setMessages(prev => {
+                            const existingIdx = prev.findIndex(m => m.id === event.message.id);
+                            if (existingIdx >= 0) {
+                                const updated = [...prev];
+                                updated[existingIdx].content += event.message.delta;
+                                updated[existingIdx].timestamp = timestamp;
+                                return updated;
+                            } else {
+                                return [...prev, {
+                                    id: event.message.id,
+                                    role: event.message.role,
+                                    content: event.message.delta,
+                                    timestamp: timestamp
+                                }];
+                            }
+                        });
+                    } else if (event.message.content) {
+                        const newMessage = {
+                            id: event.message.id,
+                            role: event.message.role,
+                            content: event.message.content,
+                            timestamp: timestamp
+                        };
+                        
+                        // Check if this is a route selection message
+                        if (event.message.content.includes("Multiple Routes Found!")) {
+                            setCurrentRouteMessageId(event.message.id);
+                            extractRoutesFromMessage(event.message.content);
+                        }
+                        
+                        setMessages(prev => [...prev, newMessage]);
+                    }
+                } else if (event.content) {
+                    setMessages(prev => [...prev, {
+                        role: "assistant",
+                        content: event.content,
+                        timestamp: timestamp
+                    }]);
+                }
+                break;
+                
+            case "TOOL_CALL_START":
+                setMessages(prev => [...prev, {
+                    role: "system",
+                    content: `🛠️ Starting ${event.toolCallName}...`,
+                    timestamp: timestamp
+                }]);
+                break;
+                
+            case "TOKEN_USAGE":
+                console.log("TOKEN_USAGE event received:", event.phase, event.usage);
+                setTokenUsage(prev => ({
+                    ...prev,
+                    [event.phase]: event.usage
+                }));
+                
+                if (event.phase === 'total' && event.usage) {
+                    setMessages(prev => [...prev, {
+                        role: "system",
+                        content: `📊 Token Usage: ${event.usage.total_tokens || 0} total (${event.usage.prompt_tokens || 0} prompt + ${event.usage.completion_tokens || 0} completion)`,
+                        timestamp: timestamp
+                    }]);
+                }
+                break;
+                
+            case "RUN_FINISHED":
+                setAgentState({ phase: 'idle', progress: 0, message: '' });
+                break;
+                
+            case "RUN_ERROR":
+                setMessages(prev => [...prev, {
+                    role: "assistant",
+                    content: "❌ " + event.error,
+                    timestamp: timestamp
+                }]);
+                setAgentState({ phase: 'idle', progress: 0, message: '' });
+                break;
+                
+            default:
+                console.log('Unhandled event type:', event.type);
+                break;
+        }
+    }
+
+    // Extract routes from message content for better display
+    const extractRoutesFromMessage = (content) => {
+        const routeLines = content.split('\n').filter(line => 
+            line.trim().startsWith('**') && line.includes('→') && !line.includes('Multiple Routes')
+        );
+        
+        const routes = routeLines.map(line => {
+            // Extract route info from formatted line
+            const match = line.match(/\*\*(\d+)\.\s+([A-Z]+)\s+→\s+([A-Z]+)\*\*/);
+            if (match) {
+                return {
+                    number: parseInt(match[1]),
+                    start: match[2],
+                    end: match[3],
+                    display: line.replace('**', '').replace('**', '')
+                };
+            }
+            return null;
+        }).filter(route => route !== null);
+        
+        setAvailableRoutes(routes);
+    };
+
+    // Handle quick route selection via buttons
+    const handleQuickRouteSelect = (routeNumber) => {
+        setInput(routeNumber.toString());
+        // Auto-submit after a brief delay for better UX
+        setTimeout(() => {
+            sendMessage();
+        }, 100);
+    };
+
+    const StatusIndicator = () => {
+        if (agentState.phase === 'idle' && !tokenUsage.total) return null;
+        
+        const phaseIcons = {
+            thinking: '🧠',
+            processing: '🛠️', 
+            typing: '✍️',
+            finished: '✅',
+            idle: '✅'
+        };
+        
+        return (
+            <div className={`status-indicator ${agentState.phase}`}>
+                <div className="status-content">
+                    <div className="status-header">
+                        <span className="status-icon">{phaseIcons[agentState.phase]}</span>
+                        <span className="status-message">{agentState.message}</span>
+                    </div>
+                    
+                    {tokenUsage.total && (
+                        <div className="token-usage">
+                            <div className="token-breakdown">
+                                <span className="token-label">Total Tokens: </span>
+                                <span className="token-value">{tokenUsage.total.total_tokens || 0}</span>
+                            </div>
+                            <div className="token-details">
+                                <span>Prompt: {tokenUsage.total.prompt_tokens || 0}</span>
+                                <span>Completion: {tokenUsage.total.completion_tokens || 0}</span>
+                            </div>
+                        </div>
+                    )}
+                    
+                    {agentState.progress > 0 && (
+                        <div className="progress-bar">
+                            <div 
+                                className="progress-fill"
+                                style={{ width: `${agentState.progress}%` }}
+                            ></div>
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    // Enhanced Route Selection Component
+    const RouteSelection = ({ routes, messageId }) => {
+        if (!routes || routes.length === 0) return null;
+
+        return (
+            <div className="route-selection-container">
+                <div className="route-selection-header">
+                    <span className="route-selection-icon">🛫</span>
+                    <span className="route-selection-title">Select Your Route</span>
+                </div>
+                <div className="route-options-grid">
+                    {routes.map(route => (
+                        <button
+                            key={route.number}
+                            className="route-option-button"
+                            onClick={() => handleQuickRouteSelect(route.number)}
+                        >
+                            <div className="route-number">{route.number}</div>
+                            <div className="route-details">
+                                <div className="route-stations">{route.start} → {route.end}</div>
+                                <div className="route-action">Click to select</div>
+                            </div>
+                        </button>
+                    ))}
+                </div>
+                <div className="route-selection-hint">
+                    💡 You can also type the route number (1-{routes.length}) and press Enter
+                </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="chat-container">
+            <div className="messages-container">
+                {messages.map((msg, idx) => (
+                    <div key={msg.id || idx} className="message-wrapper">
+                        <MessageBubble 
+                            role={msg.role} 
+                            content={msg.content} 
+                            timestamp={msg.timestamp}
+                        />
+                        {msg.id === currentRouteMessageId && availableRoutes.length > 0 && (
+                            <RouteSelection 
+                                routes={availableRoutes} 
+                                messageId={msg.id}
+                            />
+                        )}
+                    </div>
+                ))}
+                
+                <StatusIndicator />
+                
+                {loading && agentState.phase === 'idle' && (
+                    <div className="loading-message">
+                        <div className="loading-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                        <div className="loading-timestamp">
+                            {new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                    </div>
+                )}
+                <div ref={messagesEndRef} />
+            </div>
+
+            <div className="input-container">
+                {showRouteHint && (
+                    <div className="route-selection-hint-input">
+                        <span className="hint-icon">💡</span>
+                        Simply type the route number (1, 2, 3, etc.) and press Enter
+                    </div>
+                )}
+                <input
+                    type="text"
+                    className="message-input"
+                    placeholder={
+                        showRouteHint 
+                            ? "Enter route number (1, 2, 3...)" 
+                            : "Ask about a flight, e.g. 'Why was 6E215 delayed on June 23, 2024?'"
+                    }
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                    disabled={loading}
+                />
+                <button
+                    onClick={sendMessage}
+                    className="send-button"
+                    disabled={loading}
+                >
+                    {showRouteHint ? "Select" : "Send"}
+                </button>
+            </div>
+        </div>
+    );
+}
+#######################################
+import React from "react";
+
+export default function MessageBubble({ role, content, timestamp }) {
+  // Format content with better styling for route options
+  const formatContent = (text) => {
+    if (!text) return text;
+    
+    // Split by lines and format route options
+    const lines = text.split('\n');
+    return lines.map((line, index) => {
+      // Style route options with better formatting
+      if (line.trim().startsWith('**') && line.includes('→') && !line.includes('Multiple Routes')) {
+        return (
+          <div key={index} className="route-option-line">
+            {line}
+          </div>
+        );
+      }
+      
+      // Style headers
+      if (line.includes('Multiple Routes Found!')) {
+        return (
+          <div key={index} className="route-header-line">
+            {line}
+          </div>
+        );
+      }
+      
+      // Style regular text
+      return (
+        <div key={index} className="message-line">
+          {line}
+        </div>
+      );
+    });
+  };
+
+  return (
+    <div className={`message ${role}-message`}>
+      <div className="message-content">
+        <div className="message-text">{formatContent(content)}</div>
+        <div className="message-timestamp">{timestamp}</div>
+      </div>
+    </div>
+  );
+}
+#############################
+/* Enhanced Route Selection Styles */
+.route-selection-container {
+    margin: 1rem 0;
+    padding: 1.5rem;
+    background: linear-gradient(135deg, #f0f4ff, #e0e7ff);
+    border: 1px solid #c7d2fe;
+    border-radius: 12px;
+    border-left: 4px solid #4f46e5;
+}
+
+.route-selection-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.route-selection-icon {
+    font-size: 1.25rem;
+}
+
+.route-selection-title {
+    font-weight: 600;
+    color: #374151;
+    font-size: 1rem;
+}
+
+.route-options-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+}
+
+.route-option-button {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 1rem;
+    background: white;
+    border: 2px solid #e5e7eb;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    text-align: left;
+}
+
+.route-option-button:hover {
+    border-color: #4f46e5;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.15);
+}
+
+.route-number {
+    width: 32px;
+    height: 32px;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: white;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 600;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+
+.route-details {
+    flex: 1;
+}
+
+.route-stations {
+    font-weight: 600;
+    color: #1e40af;
+    font-size: 0.95rem;
+    margin-bottom: 0.25rem;
+}
+
+.route-action {
+    font-size: 0.8rem;
+    color: #6b7280;
+}
+
+.route-selection-hint {
+    background: rgba(79, 70, 229, 0.1);
+    color: #4f46e5;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    text-align: center;
+    border: 1px solid rgba(79, 70, 229, 0.2);
+}
+
+.route-selection-hint-input {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: white;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 0.75rem;
+    font-size: 0.85rem;
+    text-align: center;
+    animation: pulse 2s infinite;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+}
+
+.hint-icon {
+    font-size: 1rem;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.8; }
+}
+
+/* Enhanced message styling */
+.route-option-line {
+    padding: 0.75rem;
+    margin: 0.5rem 0;
+    background: #f8fafc;
+    border-radius: 8px;
+    border-left: 3px solid #4f46e5;
+    font-weight: 500;
+}
+
+.route-header-line {
+    font-weight: 600;
+    color: #1e40af;
+    margin-bottom: 1rem;
+    font-size: 1.1rem;
+}
+
+.message-line {
+    margin-bottom: 0.5rem;
+    line-height: 1.5;
+}
+
+/* Improved status indicator */
+.status-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.status-indicator.finished .token-usage {
+    margin-top: 1rem;
+    padding: 1rem;
+    background: rgba(255, 255, 255, 0.9);
+    border-radius: 8px;
+    border: 1px solid rgba(79, 70, 229, 0.2);
+}
+
+/* Message wrapper for grouping */
+.message-wrapper {
+    margin-bottom: 1rem;
+}
+
+/* Enhanced token usage display */
+.token-usage {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    background: rgba(255, 255, 255, 0.9);
+    border-radius: 8px;
+    border: 1px solid rgba(79, 70, 229, 0.2);
+    backdrop-filter: blur(10px);
+}
+
+.token-breakdown {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+
+.token-label {
+    font-weight: 600;
+    color: #374151;
+    font-size: 0.9rem;
+}
+
+.token-value {
+    font-weight: 700;
+    color: #4f46e5;
+    font-size: 1rem;
+}
+
+.token-details {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    color: #6b7280;
+}
+
+.token-details span {
+    padding: 0.25rem 0.5rem;
+    background: rgba(79, 70, 229, 0.1);
+    border-radius: 4px;
+}
+
+/* Responsive improvements */
+@media (max-width: 768px) {
+    .route-options-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .route-option-button {
+        padding: 0.75rem;
+    }
+    
+    .route-selection-container {
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+    
+    .token-details {
+        flex-direction: column;
+        gap: 0.25rem;
+    }
+    
+    .token-details span {
+        text-align: center;
+    }
+}
+
+/* Loading state improvements */
+.loading-message {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    margin-bottom: 1.5rem;
+}
+
+.loading-dots {
+    display: flex;
+    gap: 0.25rem;
+    padding: 1rem 1.25rem;
+    background: white;
+    border-radius: 18px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+/* Input container enhancements */
+.input-container {
+    display: flex;
+    gap: 0.75rem;
+    padding: 1.5rem;
+    background: white;
+    border-top: 1px solid #e5e7eb;
+    position: relative;
+}
+
+.message-input {
+    flex: 1;
+    padding: 0.75rem 1rem;
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    font-size: 0.95rem;
+    outline: none;
+    transition: all 0.2s;
+    background: white;
+}
+
+.message-input:focus {
+    border-color: #4f46e5;
+    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+}
+
+.send-button {
+    padding: 0.75rem 1.5rem;
+    background: linear-gradient(135deg, #4f46e5, #7c3aed);
+    color: white;
+    border: none;
+    border-radius: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    min-width: 80px;
+}
+
+.send-button:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
+}
+
+.send-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
