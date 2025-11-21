@@ -1,3 +1,67 @@
+INFO:     Waiting for application startup.
+INFO:FlightOps.MCPClient:Connecting to MCP server at http://127.0.0.1:8000/mcp
+INFO:httpx:HTTP Request: POST http://127.0.0.1:8000/mcp "HTTP/1.1 200 OK"
+INFO:mcp.client.streamable_http:Received session ID: b7b297a158ed4a7d971c68c00390366e
+INFO:mcp.client.streamable_http:Negotiated protocol version: 2025-06-18
+INFO:FlightOps.MCPClient:✅ Connected to MCP server successfully
+INFO:     Application startup complete.
+INFO:httpx:HTTP Request: POST http://127.0.0.1:8000/mcp "HTTP/1.1 202 Accepted"
+INFO:httpx:HTTP Request: GET http://127.0.0.1:8000/mcp "HTTP/1.1 200 OK"
+INFO:     127.0.0.1:51259 - "OPTIONS /agent HTTP/1.1" 200 OK
+============================================================
+🎯 DEBUG 1: NEW REQUEST RECEIVED
+🎯 Thread ID: thread-1763705052269
+🎯 Run ID: run-1763705052269
+🎯 Total messages: 1
+🎯 Current route_selection_context keys: []
+🎯 Message 0: user - give delay info for flight 6e215 on 2024-06-23...
+============================================================
+🎯 DEBUG 3: CHECKING ROUTE SELECTION CONTEXT
+🎯 Looking for thread_id: thread-1763705052269
+🎯 All context keys: []
+🎯 ❌ THREAD ID NOT FOUND IN CONTEXT
+🎯 Final is_route_selection: False, user_selected_route: None
+INFO:     127.0.0.1:51259 - "POST /agent HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+🎯 📋 GENERATED PLAN: [{'tool': 'get_delay_summary', 'arguments': {'carrier': '6E', 'flight_number': '215', 'date_of_origin': '2024-06-23'}}]
+DEBUG: Planning token usage: {'prompt_tokens': 1715, 'completion_tokens': 64, 'total_tokens': 1779}
+🎯 🔧 EXECUTING TOOL: get_delay_summary with args: {'carrier': '6E', 'flight_number': '215', 'date_of_origin': '2024-06-23'}
+INFO:FlightOps.MCPClient:Calling tool: get_delay_summary with args: {'carrier': '6E', 'flight_number': '215', 'date_of_origin': '2024-06-23'}
+INFO:httpx:HTTP Request: POST http://127.0.0.1:8000/mcp "HTTP/1.1 200 OK"
+INFO:httpx:HTTP Request: POST http://127.0.0.1:8000/mcp "HTTP/1.1 200 OK"
+🎯 DEBUG 2: TOOL EXECUTION RESULT
+🎯 Tool Name: get_delay_summary
+🎯 Tool Args: {'carrier': '6E', 'flight_number': '215', 'date_of_origin': '2024-06-23'}
+🎯 Tool Result Type: <class 'dict'>
+🎯 Tool Result Keys: dict_keys(['ok', 'data'])
+🎯 Tool Result OK: True
+🎯 Tool Data Keys: dict_keys(['status', 'multiple_routes', 'message', 'available_routes', 'instruction', 'next_step']) 
+🎯 Tool Data Status: route_selection_required
+🎯 Checking for route selection requirement...
+🎯 Data status: route_selection_required
+🎯 ✅ ROUTE SELECTION REQUIRED - Storing context...
+🎯 ✅ CONTEXT STORED for thread: thread-1763705052269
+🎯 Available routes count: 2
+🎯 Now route_selection_context has keys: ['thread-1763705052269']
+============================================================
+🎯 DEBUG 1: NEW REQUEST RECEIVED
+🎯 Thread ID: thread-1763705062522
+🎯 Run ID: run-1763705062522
+🎯 Total messages: 1
+🎯 Current route_selection_context keys: ['thread-1763705052269']
+🎯 Message 0: user - 1...
+============================================================
+🎯 DEBUG 3: CHECKING ROUTE SELECTION CONTEXT
+🎯 Looking for thread_id: thread-1763705062522
+🎯 All context keys: ['thread-1763705052269']
+🎯 ❌ THREAD ID NOT FOUND IN CONTEXT
+🎯 Final is_route_selection: False, user_selected_route: None
+INFO:     127.0.0.1:61486 - "POST /agent HTTP/1.1" 200 OK
+INFO:httpx:HTTP Request: POST https://6e-openai-sandbox-aops.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+🎯 📋 GENERATED PLAN: []
+DEBUG: Planning token usage: {'prompt_tokens': 1699, 'completion_tokens': 12, 'total_tokens': 1711}
+(ye ag_ui_mai error debug kr ra h ki option choose krne ke bad dobara tool kuni run ho ra h)
+#################################################################################
 import os
 import json
 import asyncio
